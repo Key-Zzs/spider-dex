@@ -23,3 +23,8 @@ joint-limit/continuity metrics, and tracking statistics. The tracked smoke
 threshold config deliberately reports an executable trajectory with excessive
 tracking error as `AUTO_PIPELINE_PASS_MANUAL_REVIEW_REQUIRED` rather than
 silently widening thresholds.
+
+For manual acceptance, generate `grab_interactive_viewer source` and
+`grab_interactive_viewer wuji`. These are self-contained Plotly HTML files with
+frame sliders, orbit/zoom/pan controls, source/world axes, and source-vs-Wuji
+overlay; use them instead of a fixed camera MP4 for coordinate-frame review.

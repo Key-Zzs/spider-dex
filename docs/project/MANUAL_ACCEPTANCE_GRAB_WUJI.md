@@ -3,12 +3,26 @@
 Current primary pilot: `s1/mug_lift`, frames `[120, 240)`, 120 Hz, bimanual
 source streams, object `mug`.
 
+Prefer the self-contained interactive HTML reports: they support orbit, pan,
+zoom, trace visibility toggles, and frame sliders. The source report includes
+world XYZ axes; the Wuji report overlays source hands on the real robot visual
+mesh and the source object, so frame-local spatial disagreement is directly
+visible. In the Wuji report, source right/left are red/blue and Wuji
+right/left are purple/teal, respectively.
+
 ```bash
 # Source replay
 xdg-open <workspace>/processed/grab/canonical/s1__mug_lift/visualization/source_replay.mp4
 
 # Wuji replay
 xdg-open <workspace>/processed/grab/wuji_hand2_beta1/bimanual/s1__mug_lift/0/visualization_ik.mp4
+
+# Generate interactive HTML if it has not already been generated.
+conda run -n spider-dex python -m spider.tools.grab_interactive_viewer source \
+  --canonical-dir <workspace>/processed/grab/canonical/s1__mug_lift
+conda run -n spider-dex python -m spider.tools.grab_interactive_viewer wuji \
+  --robot-dir <workspace>/processed/grab/wuji_hand2_beta1/bimanual/s1__mug_lift/0 \
+  --canonical-dir <workspace>/processed/grab/canonical/s1__mug_lift
 
 # Interactive Wuji scene after generation
 conda run -n spider-dex python spider/viewers/mjcpu_viewer.py \
@@ -18,7 +32,11 @@ conda run -n spider-dex python spider/viewers/mjcpu_viewer.py \
 
 Canonical source replay:
 
-- [ ] Object mesh scale/pose is correct and shares the hand world frame.
+- [ ] At three separated slider positions, orbit around the scene and confirm
+  that the red/blue hand joints maintain a physically plausible grasp/approach
+  relation to the object from every viewpoint. A persistent separation is a
+  frame/scale failure, not a camera effect.
+- [ ] The object mesh scale/pose is correct and shares the hand world frame.
 - [ ] Neither wrist has a fixed roughly 10 cm centre offset.
 - [ ] Left/right, palm orientation, thumb side, fingertip order, axes, and time
   synchronization are correct.
@@ -27,8 +45,16 @@ Canonical source replay:
 
 Wuji replay:
 
+- [ ] Toggle source hands and compare red source-right against purple
+  Wuji-right, then blue source-left against teal Wuji-left; a side swap or
+  wrong thumb side is a FAIL.
+- [ ] Toggle source hands/object together and orbit the cup wall. The robot
+  palm/fingers must approach the same side of the yellow source object; a
+  visually wrong wall direction is a FAIL pending an IK/frame fix.
 - [ ] Each Wuji wrist follows its corresponding source wrist.
-- [ ] Thumb/index/middle/ring/pinky identity and side are correct.
+- [ ] Thumb/index/middle/ring/pinky identity and side are correct. Persistent
+  visibly reverse-bent four-finger poses are not normal for acceptance and
+  must be recorded as FAIL rather than waived as a rendering artifact.
 - [ ] There is no sustained limit lock, high-frequency jitter, frame jump, or
   swapped second hand; object motion matches source.
 - [ ] The known fingertip tracking shortfall is acceptable, or is rejected

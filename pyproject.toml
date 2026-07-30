@@ -35,6 +35,7 @@ dependencies = [
   "google-auth",
   "mink>=0.0.13,<1.0",
   "smplx",
+  "plotly",
 ]
 
 [project.scripts]
