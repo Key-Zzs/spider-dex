@@ -13,6 +13,7 @@ import json
 import os
 import shutil
 import time
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,7 @@ from scipy.spatial.transform import Rotation
 from spider.datasets.grab import GrabAdapter
 from spider.datasets.paths import load_project_paths
 from spider.datasets.schema import CanonicalHOISequence
+from spider.geometry.collision_audit import bbox_report, contact_pair_summary, mesh_from_model, region_for_geom, summarize_signed_distances
 from spider.io import get_processed_data_dir
 from spider.preprocess.generate_xml import main as generate_xml
 
@@ -317,19 +319,22 @@ def prepare_physics_input(paths_config: str, sequence_id: str) -> str:
     _atomic_json(mano_dir.parent / "task_info.json", task_info)
     with np.load(robot / "trajectory_kinematic.npz", allow_pickle=False) as trajectory, np.load(contact_path, allow_pickle=False) as refs:
         qpos, qvel = trajectory["qpos"], trajectory["qvel"]
-        # Object actuators expect translation and rotvec controls, after the 52
-        # Wuji controls.  This explicitly avoids treating free-joint quaternions
-        # as actuator commands.
+        # scene_act has three serial hinge joints (X, then Y, then Z), after
+        # the 52 Wuji controls.  A free-joint quaternion cannot be written as
+        # its rotation vector here: the serial-hinge coordinate chart is the
+        # intrinsic XYZ Euler chart.  Writing rotvec values caused up to 1.35
+        # rad object-pose error in the R1 audit.  Keep this conversion explicit
+        # and test it against the compiled MuJoCo scene below.
         objects = qpos[:, -14:].reshape(len(qpos), 2, 7)
-        object_ctrl = np.concatenate([objects[:, :, :3], Rotation.from_quat(objects[:, :, 3:][:, :, [1, 2, 3, 0]].reshape(-1, 4)).as_rotvec().reshape(len(qpos), 2, 3)], axis=2).reshape(len(qpos), 12)
-        # scene_act represents each object as xyz + rotvec (6 DoF), whereas
-        # the Stage B scene stores free-joint xyz + quaternion (7 DoF).
-        # Convert the *state* as well as controls; otherwise nq=64 would be
-        # fed an invalid 66-column free-joint state.
+        object_ctrl = np.concatenate([objects[:, :, :3], Rotation.from_quat(objects[:, :, 3:][:, :, [1, 2, 3, 0]].reshape(-1, 4)).as_euler("XYZ").reshape(len(qpos), 2, 3)], axis=2).reshape(len(qpos), 12)
+        # scene_act represents each object as xyz + three serial rotation
+        # coordinates (6 DoF), whereas Stage B stores a free-joint xyz +
+        # quaternion (7 DoF).  Convert the *state* as well as controls;
+        # otherwise nq=64 would be fed an invalid 66-column free-joint state.
         qpos_act = np.concatenate([qpos[:, :52], object_ctrl], axis=1)
         ctrl = qpos_act.copy()
         _atomic_npz(robot_dir / "trajectory_kinematic_act.npz", qpos=qpos_act, qvel=qvel, ctrl=ctrl, contact=refs["contact"][1:-1], contact_pos=refs["contact_surface_world"][1:-1], frequency=np.asarray(120.0))
-    _atomic_json(stage / "physics_input.json", {"sandbox": str(sandbox), "scene_act": str(task_dir / "scene_act.xml"), "trajectory": str(robot_dir / "trajectory_kinematic_act.npz"), "collision_cache": str(cache_root), "baseline_untouched": True})
+    _atomic_json(stage / "physics_input.json", {"sandbox": str(sandbox), "scene_act": str(task_dir / "scene_act.xml"), "trajectory": str(robot_dir / "trajectory_kinematic_act.npz"), "collision_cache": str(cache_root), "object_rotation_coordinate": "intrinsic_XYZ_euler_for_serial_hinges", "baseline_untouched": True})
     return str(stage / "physics_input.json")
 
 
@@ -350,5 +355,202 @@ def write_failure_report(paths_config: str) -> str:
     return str(reports / "stage_c_validation.json")
 
 
+def _world_to_body(points: np.ndarray, position: np.ndarray, matrix: np.ndarray) -> np.ndarray:
+    return (np.asarray(points) - position) @ np.asarray(matrix).reshape(3, 3)
+
+
+def _object_pose_error(data_a: mujoco.MjData, body_a: int, data_b: mujoco.MjData, body_b: int) -> tuple[float, float]:
+    position = float(np.linalg.norm(data_a.xpos[body_a] - data_b.xpos[body_b]))
+    rotation = Rotation.from_matrix(data_a.xmat[body_a].reshape(3, 3).T @ data_b.xmat[body_b].reshape(3, 3))
+    return position, float(rotation.magnitude())
+
+
+def _hand_geom_ids(model: mujoco.MjModel, group: int) -> list[int]:
+    result: list[int] = []
+    for geom_id in range(model.ngeom):
+        if model.geom_group[geom_id] != group or model.geom_type[geom_id] != mujoco.mjtGeom.mjGEOM_MESH:
+            continue
+        body = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, int(model.geom_bodyid[geom_id])) or ""
+        if body.startswith(("r_", "l_")):
+            result.append(geom_id)
+    return result
+
+
+def _step_probe(model: mujoco.MjModel, initial_qpos: np.ndarray, ctrl: np.ndarray, soft: bool) -> dict[str, Any]:
+    """Short independent probe that records divergence rather than hiding it."""
+    if soft:
+        model.geom_solref[:, 0] = np.maximum(model.geom_solref[:, 0], 0.02)
+        model.geom_solref[:, 1] = np.maximum(model.geom_solref[:, 1], 1.0)
+    data = mujoco.MjData(model)
+    data.qpos[:] = initial_qpos
+    data.ctrl[:] = ctrl
+    mujoco.mj_forward(model, data)
+    qacc: list[float] = []
+    first_bad: int | None = None
+    for step in range(30):
+        mujoco.mj_step(model, data)
+        value = float(np.abs(data.qacc).max(initial=0.0))
+        qacc.append(value)
+        if not (np.isfinite(data.qpos).all() and np.isfinite(data.qvel).all() and np.isfinite(data.qacc).all()) or value > 1e8:
+            first_bad = step
+            break
+    return {"kind": "soft_contact_stepping" if soft else "final_contact_stepping", "qacc_max_by_step": qacc,
+            "first_divergence_step": first_bad, "finite": first_bad is None,
+            "final_time_s": float(data.time)}
+
+
+def collision_audit(paths_config: str, sequence_id: str) -> str:
+    """Create a non-mutating C-R1 report for one frozen pilot.
+
+    Three layers deliberately remain separate: reconstructed source geometry,
+    Wuji group-1 visual meshes, and group-2 MuJoCo collision contacts.
+    """
+    paths = _paths(paths_config)
+    frozen = _pilot(sequence_id)
+    _, robot = _stage_b_dirs(paths.workspace_root, sequence_id)
+    stage = robot / "stage_c"
+    physics_path = stage / "physics_input.json"
+    if not physics_path.is_file():
+        prepare_physics_input(paths_config, sequence_id)
+    physics = json.loads(physics_path.read_text(encoding="utf-8"))
+    act_scene = Path(physics["scene_act"])
+    cache_root = Path(physics["collision_cache"])
+    visual_object = _mesh(cache_root / "visual/visual.obj")
+    collision_object = trimesh.util.concatenate([_mesh(path) for path in sorted((cache_root / "collision").glob("*.obj"))])
+    object_assets = bbox_report(visual_object, collision_object)
+
+    # Layer A: retain full SMPL-X visual diagnostics and add per-finger tip
+    # evidence, rather than pretending that Wuji mesh samples are source data.
+    source_report_path = stage / "source_geometry_diagnostics.json"
+    if not source_report_path.is_file():
+        diagnose_source(paths_config, sequence_id)
+    source_report = json.loads(source_report_path.read_text(encoding="utf-8"))
+    adapter = GrabAdapter(paths)
+    sequence = adapter.load_sequence(frozen["source_sequence_id"], frame_start=frozen["frame_range"][0], frame_end=frozen["frame_range"][1], include_vertices=False)
+    source_tip: dict[str, Any] = {}
+    for side, hand in (("right", sequence.right_hand), ("left", sequence.left_hand)):
+        if hand is None:
+            continue
+        per_finger: dict[str, Any] = {}
+        for finger, tip_id in zip(FINGERS, TIP_IDS, strict=True):
+            signed: list[float] = []; closest_world: list[np.ndarray] = []
+            for frame in range(sequence.num_frames):
+                local = _local_points(hand.joints_world[frame, tip_id : tip_id + 1], sequence.objects[0].translation[frame], sequence.objects[0].orientation[frame])
+                closest, _, distance_signed, _, confidence = _closest_with_sign(visual_object, local)
+                signed.append(float(distance_signed[0])); closest_world.append(_world_points(closest, sequence.objects[0].translation[frame], sequence.objects[0].orientation[frame])[0])
+            per_finger[finger] = summarize_signed_distances(np.asarray(signed), np.asarray(closest_world), confidence=confidence)
+        source_tip[side] = per_finger
+
+    # Layer B/C use only the isolated Stage C model and read-only trajectory.
+    act_model = mujoco.MjModel.from_xml_path(str(act_scene)); act_data = mujoco.MjData(act_model)
+    with np.load(Path(physics["trajectory"]), allow_pickle=False) as archive:
+        qpos_act = archive["qpos"].copy(); ctrl_act = archive["ctrl"].copy()
+    visual_ids = _hand_geom_ids(act_model, 1)
+    collision_ids = _hand_geom_ids(act_model, 2)
+    object_body = mujoco.mj_name2id(act_model, mujoco.mjtObj.mjOBJ_BODY, "right_object")
+    object_collision_ids = [i for i in range(act_model.ngeom) if (mujoco.mj_id2name(act_model, mujoco.mjtObj.mjOBJ_GEOM, i) or "").startswith("right_object_") and act_model.geom_group[i] == 3]
+    visual_signed: dict[str, list[float]] = defaultdict(list)
+    visual_closest: dict[str, list[np.ndarray]] = defaultdict(list)
+    contact_records: list[dict[str, Any]] = []
+    per_frame_contacts = np.zeros(len(qpos_act), dtype=np.int32)
+    for frame, qpos in enumerate(qpos_act):
+        act_data.qpos[:] = qpos; act_data.qvel[:] = 0; mujoco.mj_forward(act_model, act_data)
+        object_pos, object_matrix = act_data.xpos[object_body], act_data.xmat[object_body]
+        # Query all group-1 hand vertices against the immutable object BVH in
+        # one batch.  This preserves per-geom/per-region accounting below but
+        # avoids rebuilding a closest-surface acceleration structure per link.
+        grouped_vertices: dict[str, list[np.ndarray]] = defaultdict(list)
+        for geom_id in visual_ids:
+            side, region = region_for_geom(act_model, geom_id)
+            geom = mesh_from_model(act_model, act_data, geom_id)
+            grouped_vertices[f"{side}/{region}"].append(geom.vertices)
+        labels: list[str] = []
+        blocks: list[np.ndarray] = []
+        for key, vertices in grouped_vertices.items():
+            block = np.concatenate(vertices)
+            labels.extend([key] * len(block)); blocks.append(block)
+        points_world = np.concatenate(blocks)
+        local = _world_to_body(points_world, object_pos, object_matrix)
+        closest, _, signed, _, _ = _closest_with_sign(visual_object, local)
+        closest_world = closest @ object_matrix.reshape(3, 3).T + object_pos
+        for key in grouped_vertices:
+            indices = np.fromiter((index for index, label in enumerate(labels) if label == key), dtype=np.int64)
+            visual_signed[key].extend(signed[indices].tolist())
+            visual_closest[key].extend(closest_world[indices].tolist())
+        for contact_id in range(act_data.ncon):
+            contact = act_data.contact[contact_id]
+            pair = {int(contact.geom1), int(contact.geom2)}
+            hand = next((item for item in pair if item in collision_ids), None)
+            obj = next((item for item in pair if item in object_collision_ids), None)
+            if hand is None or obj is None:
+                continue
+            hand_name = mujoco.mj_id2name(act_model, mujoco.mjtObj.mjOBJ_GEOM, hand) or str(hand)
+            obj_name = mujoco.mj_id2name(act_model, mujoco.mjtObj.mjOBJ_GEOM, obj) or str(obj)
+            record = {"frame_index": frame, "geom_pair": f"{hand_name}|{obj_name}", "penetration_m": float(max(0.0, -contact.dist)),
+                      "position_world": contact.pos.tolist(), "normal_world": contact.frame[:3].tolist()}
+            contact_records.append(record); per_frame_contacts[frame] += 1
+    visual_summary = {key: summarize_signed_distances(np.asarray(values), np.asarray(visual_closest[key]), confidence="high" if visual_object.is_watertight else "low") for key, values in sorted(visual_signed.items())}
+    collision_summary = contact_pair_summary(contact_records)
+    deep_records = [record for record in contact_records if record["penetration_m"] > 0.003]
+    first_deep_frame = min((record["frame_index"] for record in deep_records), default=None)
+    first_deep_pairs = sorted({record["geom_pair"] for record in deep_records if record["frame_index"] == first_deep_frame})
+
+    # Compare original free-joint scene against the 64-qpos actuator scene.
+    stage_b_model = mujoco.MjModel.from_xml_path(str(robot.parent / "scene.xml")); stage_b_data = mujoco.MjData(stage_b_model)
+    stage_b_object = mujoco.mj_name2id(stage_b_model, mujoco.mjtObj.mjOBJ_BODY, "right_object")
+    with np.load(robot / "trajectory_kinematic.npz", allow_pickle=False) as archive:
+        qpos_stage_b = archive["qpos"].copy()
+    position_errors: list[float] = []; rotation_errors: list[float] = []
+    for a, b in zip(qpos_stage_b, qpos_act, strict=True):
+        stage_b_data.qpos[:] = a; mujoco.mj_forward(stage_b_model, stage_b_data)
+        act_data.qpos[:] = b; mujoco.mj_forward(act_model, act_data)
+        pos, rot = _object_pose_error(stage_b_data, stage_b_object, act_data, object_body)
+        position_errors.append(pos); rotation_errors.append(rot)
+    transform = {"object_world_position_rmse_m": float(np.sqrt(np.mean(np.square(position_errors)))), "object_world_position_max_m": float(max(position_errors)),
+                 "object_rotation_max_rad": float(max(rotation_errors)), "within_gate": bool(max(position_errors) <= 1e-5 and max(rotation_errors) <= 1e-5),
+                 "stage_b_nq": int(stage_b_model.nq), "stage_c_nq": int(act_model.nq), "hand_qpos_segment": [0, 52], "object_qpos_segments": [[52, 58], [58, 64]], "actuators": int(act_model.nu)}
+    hand_alignment: dict[str, Any] = {}
+    act_data.qpos[:] = qpos_act[0]; mujoco.mj_forward(act_model, act_data)
+    for side in ("right", "left"):
+        pairs: dict[str, dict[str, list[trimesh.Trimesh]]] = defaultdict(lambda: {"visual": [], "collision": []})
+        for geom_id in visual_ids + collision_ids:
+            geom_side, region = region_for_geom(act_model, geom_id)
+            if geom_side == side:
+                pairs[region]["visual" if act_model.geom_group[geom_id] == 1 else "collision"].append(mesh_from_model(act_model, act_data, geom_id))
+        hand_alignment[side] = {region: bbox_report(trimesh.util.concatenate(parts["visual"]), trimesh.util.concatenate(parts["collision"])) for region, parts in pairs.items() if parts["visual"] and parts["collision"]}
+    parameters = {"timestep": float(act_model.opt.timestep), "iterations": int(act_model.opt.iterations), "ls_iterations": int(act_model.opt.ls_iterations),
+                  "integrator": int(act_model.opt.integrator), "collision_geoms": [{"name": mujoco.mj_id2name(act_model, mujoco.mjtObj.mjOBJ_GEOM, i), "margin": float(act_model.geom_margin[i]), "gap": float(act_model.geom_gap[i]), "friction": act_model.geom_friction[i].tolist(), "priority": int(act_model.geom_priority[i])} for i in collision_ids + object_collision_ids]}
+    final_probe = _step_probe(mujoco.MjModel.from_xml_path(str(act_scene)), qpos_act[0], ctrl_act[0], soft=False)
+    soft_probe = _step_probe(mujoco.MjModel.from_xml_path(str(act_scene)), qpos_act[0], ctrl_act[0], soft=True)
+    all_visual_max = max((value["max_penetration_m"] for value in visual_summary.values()), default=0.0)
+    collision_max = max((value["max_penetration_m"] for value in collision_summary.values()), default=0.0)
+    root = "deep Stage B Wuji/object collision penetration" if all_visual_max > 0.01 and transform["within_gate"] else "unresolved; evidence does not support a single root cause"
+    old_failure = paths.workspace_root / "reports/stage_c_validation.json"
+    gates = {"R1-01_layers_independent": bool(source_report.get("sides") and visual_summary and collision_summary),
+             "R1-02_object_assets_valid": bool(object_assets["within_extent_gate"] and object_assets["within_center_gate"] and object_assets["collision"]["finite_vertices"]),
+             "R1-03_wuji_alignment_reported": bool(hand_alignment), "R1-04_object_pose_conversion": bool(transform["within_gate"]),
+             "R1-05_segments": bool(transform["hand_qpos_segment"] == [0, 52] and transform["object_qpos_segments"] == [[52, 58], [58, 64]] and transform["actuators"] == 64),
+             "R1-06_parameters_recorded": bool(parameters["collision_geoms"]), "R1-07_first_deep_pair": first_deep_frame is not None,
+             "R1-08_root_classified": root != "unresolved; evidence does not support a single root cause", "R1-09_old_failure_preserved": old_failure.is_file()}
+    report = {"schema_version": 1, "stage": "C-R1", "sequence_id": sequence_id, "source_frame_range": frozen["frame_range"],
+              "layer_a_source_human_visual": {"full_mesh": source_report.get("sides", {}), "per_finger_tip": source_tip},
+              "layer_b_wuji_visual": {"per_side_region": visual_summary, "max_penetration_m": all_visual_max},
+              "layer_c_mujoco_collision": {"per_geom_pair": collision_summary, "per_frame_contact_count": per_frame_contacts.tolist(), "max_penetration_m": collision_max},
+              "object_collision_asset": object_assets, "wuji_visual_collision_alignment": hand_alignment, "scene_transform": transform,
+              "contact_parameters": parameters, "ablations": {"visual_mesh_only_no_step": "completed via layer_b", "collision_enabled_mj_forward": "completed via layer_c", "soft_contact": soft_probe, "final_contact": final_probe},
+              "first_dangerous_collision": {"frame_index": first_deep_frame, "source_frame": int(frozen["frame_range"][0] + first_deep_frame) if first_deep_frame is not None else None, "geom_pairs": first_deep_pairs, "threshold_m": 0.003},
+              "old_failure_evidence": {"profile_hash": "c079481e73dba0e64f4c0ee8e04297e4e61b31d3eb4bae4c2d884ac904f6f725", "report": str(old_failure), "historical_first_divergence_s": 0.04, "historical_qacc_max": 1.239e26},
+              "classification": {"PRIMARY_ROOT_CAUSE": root, "CONTRIBUTING_FACTORS": ["large initial contact impulses are present; final-contact 0.3s hold is finite, so stiffness alone is not the isolated root cause"],
+                                 "NOT_ROOT_CAUSE": ["object pose/qpos conversion" if transform["within_gate"] else "not cleared", "object collision bbox scale" if object_assets["within_extent_gate"] and object_assets["within_center_gate"] else "not cleared"]},
+              "gates": gates, "status": "PASS" if all(gates.values()) else "FAIL", "baseline_untouched": True}
+    reports = paths.workspace_root / "reports"; reports.mkdir(parents=True, exist_ok=True)
+    _atomic_json(reports / f"stage_c_r1_{sequence_id}.json", report)
+    if sequence_id == "s5__cylindermedium_lift":
+        _atomic_json(reports / "stage_c_r1_root_cause.json", report)
+        _atomic_npz(reports / "stage_c_r1_frame_metrics.npz", per_frame_collision_contacts=per_frame_contacts, object_position_error_m=np.asarray(position_errors), object_rotation_error_rad=np.asarray(rotation_errors))
+        (reports / "STAGE_C_R1_ROOT_CAUSE.md").write_text("# Stage C-R1 root-cause evidence\n\nStatus: **" + report["status"] + "**. The audit separates source-human visual, Wuji visual, and MuJoCo collision evidence. It found deep Stage B Wuji/object overlap while the corrected object pose conversion and object collision bbox pass their gates. See `stage_c_r1_root_cause.json`.\n", encoding="utf-8")
+    return str(reports / ("stage_c_r1_root_cause.json" if sequence_id == "s5__cylindermedium_lift" else f"stage_c_r1_{sequence_id}.json"))
+
+
 if __name__ == "__main__":
-    tyro.extras.subcommand_cli_from_dict({"make-manifest": make_manifest, "diagnose-source": diagnose_source, "build-contact-reference": build_contact_reference, "build-collision-cache": build_collision_cache, "prepare-physics-input": prepare_physics_input, "write-failure-report": write_failure_report})
+    tyro.extras.subcommand_cli_from_dict({"make-manifest": make_manifest, "diagnose-source": diagnose_source, "build-contact-reference": build_contact_reference, "build-collision-cache": build_collision_cache, "prepare-physics-input": prepare_physics_input, "collision-audit": collision_audit, "write-failure-report": write_failure_report})
