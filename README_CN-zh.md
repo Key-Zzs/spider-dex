@@ -15,7 +15,9 @@ Wuji 手模型适配层。仓库只保存代码、机器人描述、配置与测
 - S0：仓库审查与项目脚手架，已完成。
 - S1：上游 SPIDER baseline，用户已报告完成；本次保留了有界回归检查。
 - S2：Wuji Hand2 Beta1，自动化 embodiment 验证已完成；**人工可视化验收仍待用户完成**。
-- S3–S8：数据集 adapter、重定向实验、评估与导出，尚未开始。
+- Stage A：外部数据路径、workspace、canonical HOI 契约、registry、manifest
+  与审计工具，自动验证已通过。
+- Stage B：有界 GRAB 到 Wuji 运动学 pilot，自动流程已通过；追踪质量仍待人工复核。
 
 当前没有声称已经完成 GRAB、OakInk、OakInk2 重定向、完整物理优化调参或
 真机验证。
@@ -26,8 +28,8 @@ Wuji 手模型适配层。仓库只保存代码、机器人描述、配置与测
 控制语义的六自由度标量腕部。它支持无数据集的 MuJoCo 加载、运行时资产
 staging、scene generation 和后续 IK 接入。
 
-本阶段不实现 GRAB/OakInk/OakInk2 adapter，不复制或移动数据集，不运行全量
-处理或全量 physics optimization，也不接入真机或导出真机指令。
+本阶段不复制或移动数据集，不运行全量处理或全量 physics optimization，也不
+接入真机或导出真机指令。
 
 ## 快速开始
 
@@ -54,6 +56,11 @@ WUJI_DESCRIPTION_ROOT=/path/to/wuji-description
 
 数据集和 processed 输出始终放在仓库外。不要提交 GRAB、OakInk、OakInk2、
 MANO 模型、视频或大规模处理轨迹。
+
+数据转换请把 `configs/project/paths.example.yaml` 复制为被忽略的
+`configs/local/paths.yaml`。其中明确分离只读 dataset/body model root 与
+可写的外部 workspace；详见[数据基础设施](docs/project/DATA_INFRASTRUCTURE.md)
+和[canonical schema](docs/project/CANONICAL_HOI_SCHEMA.md)。
 
 ## 工作流
 
@@ -84,6 +91,7 @@ S2 只完成图中的目标机器人 embodiment；数据集 adapter 从 S3 开�
 - [Wuji Hand2 Beta1 适配](docs/project/WUJI_HAND2_BETA1.md)
 - [资产溯源](docs/project/ASSET_PROVENANCE.md)
 - [自动验证与人工验收](docs/project/VALIDATION.md)
+- [Stage A/B 交接](docs/project/HANDOFF_STAGE_AB.md)
 
 ## 许可证、致谢与引用
 

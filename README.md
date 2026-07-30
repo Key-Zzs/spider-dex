@@ -18,8 +18,10 @@ trajectory collections.
   this change retains a bounded regression check.
 - S2 — Wuji Hand2 Beta1 integration: automated embodiment validation complete;
   **manual visual acceptance remains pending**.
-- S3–S8 — dataset adapters, retargeting experiments, evaluation, and export:
-  not started.
+- Stage A — external data paths, workspace, canonical HOI contract, registry,
+  manifest, and audit tooling: automated validation passed.
+- Stage B — bounded GRAB-to-Wuji kinematic pilots: automated pipeline passed;
+  tracking-quality manual review remains pending.
 
 No claim is made here that GRAB, OakInk, OakInk2, full physics optimization, or
 real-hardware validation has been completed.
@@ -30,9 +32,8 @@ The current target is a five-finger, 20-actuator Wuji Hand2 Beta1 model with
 SPIDER-compatible six-DoF scalar wrist controls. It supports data-free MuJoCo
 loading, runtime asset staging, scene generation, and later IK integration.
 
-This stage deliberately does not add a GRAB/OakInk/OakInk2 adapter, copy or move
-datasets, process full datasets, tune full physics optimization, communicate with
-hardware, or export hardware joint commands.
+This stage does not copy or move datasets, process a full dataset, tune physics
+optimization, communicate with hardware, or export hardware joint commands.
 
 ## Repository overview
 
@@ -65,6 +66,12 @@ bimanual models. The second command opens MuJoCo for human inspection. See the
 Copy `.env.example` to an ignored `.env.local` if a local workflow needs path
 reminders. Public code and MJCF use relative paths; no command depends on a
 developer-specific location.
+
+For data conversion, copy `configs/project/paths.example.yaml` to ignored
+`configs/local/paths.yaml`. It explicitly separates immutable dataset and body
+model roots from the writable external workspace. See
+[data infrastructure](docs/project/DATA_INFRASTRUCTURE.md) and the
+[canonical schema](docs/project/CANONICAL_HOI_SCHEMA.md).
 
 ```bash
 SPIDER_DATA_ROOT=/path/to/Ref2Dex_storage
@@ -105,6 +112,7 @@ work begins at S3. The detailed contract is in [WORKFLOW.md](docs/project/WORKFL
 - [Wuji Hand2 Beta1 adapter](docs/project/WUJI_HAND2_BETA1.md)
 - [Asset provenance](docs/project/ASSET_PROVENANCE.md)
 - [Validation and manual acceptance](docs/project/VALIDATION.md)
+- [Stage A/B handoff](docs/project/HANDOFF_STAGE_AB.md)
 
 ## License and third-party assets
 

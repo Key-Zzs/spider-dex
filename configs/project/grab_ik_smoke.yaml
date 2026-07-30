@@ -1,0 +1,7 @@
+schema_version: 1
+
+# Fixed before pilot execution. Exceeding either tracking criterion keeps a
+# structurally valid result in manual-review state; it is not silently accepted.
+quality:
+  wrist_rmse_m: 0.03
+  fingertip_rmse_m: 0.08

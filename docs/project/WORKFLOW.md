@@ -42,3 +42,12 @@ The scene places robot qpos before later object qpos. For bimanual Wuji, control
 and robot qpos are `[right 26][left 26]`; a future generated object remains
 after those 52 robot coordinates. Full dataset adapters and physics optimization
 configuration are future stages, not an S2 claim.
+
+## External source contract
+
+Stage A adds a separate, external workspace contract without changing the
+legacy `dataset_dir` layout consumed by existing SPIDER processors. Configure
+source data, body models, and workspace through an ignored local copy of
+`configs/project/paths.example.yaml`. Canonical HOI outputs are the adapter
+boundary; the later GRAB bridge materializes the established SPIDER layout only
+inside the external workspace.

@@ -1,5 +1,33 @@
 # Validation and manual acceptance
 
+## Stage A external-data validation
+
+Run the targeted infrastructure suite and configuration audit before a dataset
+adapter is enabled:
+
+```bash
+conda run -n spider-dex python -m unittest tests.test_dataset_infrastructure -v
+conda run -n spider-dex python -m spider.tools.audit_dataset \
+  --dataset grab --paths-config configs/local/paths.yaml --dry-run
+conda run -n spider-dex python -m compileall spider tests
+git diff --check
+```
+
+The Stage A audit verifies paths and workspace even before GRAB registration;
+`ADAPTER_NOT_REGISTERED` is an explicit pre-adapter state, never a fabricated
+dataset scan result. Once an adapter is registered, the same command performs
+its source audit and reports a structured JSON result.
+
+## Stage B bounded GRAB pilots
+
+The primary `s1/mug_lift` and two deterministic smoke pilots have structural
+output checks for source/canonical data, object mesh, scene, Wuji model, named
+trajectory, limits, mapping, and videos. Their fixed fingertip smoke threshold
+is exceeded, so the accurate quality state is
+`AUTO_PIPELINE_PASS_MANUAL_REVIEW_REQUIRED`; see
+[manual acceptance](MANUAL_ACCEPTANCE_GRAB_WUJI.md). This is not a physics or
+contact-optimization result.
+
 ## Automated validation
 
 Run from the repository root:
@@ -37,9 +65,9 @@ local baseline-data gate failure, not a Wuji regression claim—the existing sam
 and robot are unchanged by S2. The bounded completion establishes that the
 unmodified XHand path remains executable once that pre-existing gate is disabled.
 
-Dataset-dependent Wuji scene/IK smoke testing is **BLOCKED BY MISSING LOCAL
-SAMPLE** until S3/S4 supply an explicitly scoped input. It is not reported as a
-pass.
+The former dataset-dependent Wuji scene/IK smoke blocker is resolved for the
+bounded external GRAB pilots described above. It does not change the historical
+upstream baseline gate statement.
 
 ## Manual visual acceptance
 

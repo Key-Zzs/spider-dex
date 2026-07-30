@@ -1,0 +1,14 @@
+schema_version: 1
+
+# Copy this file to configs/local/paths.yaml and set local paths there.  The
+# local directory is ignored; raw datasets, body models, and outputs never
+# belong in this repository.
+datasets:
+  grab:
+    source_root: /path/to/GRAB
+
+body_models:
+  root: /path/to/shared_assets/body_models
+
+workspace:
+  root: /path/to/spider_workspace

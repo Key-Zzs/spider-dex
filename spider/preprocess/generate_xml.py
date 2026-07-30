@@ -259,10 +259,11 @@ def main(
     # small 3x3cm square that sits *inside* the object's lower bbox: its
     # bottom is flush with the object's lowest mesh z (z=0) and its top lifts
     # upward, so the plate adds no height below the object.
-    if embodiment_type in ["right", "bimanual"]:
-        material_name = "right_groundplane"
-    else:
-        material_name = "left_groundplane"
+    # The material is created above in this function.  Some legacy robot XMLs
+    # happen to define side-specific ground materials, but portable staged
+    # assets such as Wuji do not; referring to those undeclared names makes
+    # otherwise valid generated scenes fail at MjSpec compilation.
+    material_name = "groundplane"
     floor_z = -0.001
     mj_spec.worldbody.add_geom(
         name="floor",

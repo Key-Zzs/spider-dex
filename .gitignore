@@ -130,6 +130,7 @@ celerybeat.pid
 # Environments
 .env
 .env.local
+configs/local/
 .venv
 env/
 venv/
@@ -197,6 +198,9 @@ cython_debug/
 results/
 recordings/
 datasets/
+!spider/datasets/
+!spider/datasets/**
+spider/datasets/__pycache__/
 MUJOCO_LOG.TXT
 MJDATA.TXT
 .DS_Store
