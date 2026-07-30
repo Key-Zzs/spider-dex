@@ -1,7 +1,10 @@
 # Stage B manual acceptance
 
-Current primary pilot: `s1/mug_lift`, frames `[120, 240)`, 120 Hz, bimanual
-source streams, object `mug`.
+Current frozen primary pilot: `s5/cylindermedium_lift`, frames `[1460, 1876)`,
+120 Hz, object `cylindermedium`. It was selected source-only because both
+hands have sustained fingertip proximity to the real object surface; the
+initial part includes the right-hand approach. `s1/mug_lift` is retained only
+as a right-source smoke, not a bimanual primary.
 
 Prefer the self-contained interactive HTML reports: they support orbit, pan,
 zoom, trace visibility toggles, and frame sliders. The source report includes

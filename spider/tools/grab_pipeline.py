@@ -26,6 +26,30 @@ from spider.io import get_processed_data_dir
 
 matplotlib.use("Agg")
 
+_FINGERS = ("thumb", "index", "middle", "ring", "pinky")
+_FINGERTIP_INDICES = (4, 8, 12, 16, 20)
+# SMPL-X wrist axes and the Wuji palm-root axes are both right-handed but do
+# not use the same anatomical basis.  These matrices are the asset-level
+# basis change (not a sample-specific pose offset): SMPL-X +X/+Y/+Z maps to
+# the corresponding Wuji palm-root axes for each physical side.
+_SMPLX_TO_WUJI_PALM = {
+    "right": np.asarray(((0., 0., 1.), (0., -1., 0.), (1., 0., 0.))),
+    "left": np.asarray(((0., 0., -1.), (0., 1., 0.), (1., 0., 0.))),
+}
+
+
+def canonical_to_wuji_wrist_orientation(side: str, orientation_wxyz: np.ndarray) -> np.ndarray:
+    """Convert a canonical SMPL-X wrist basis to the matching Wuji palm basis."""
+    if side not in _SMPLX_TO_WUJI_PALM:
+        raise ValueError(f"Unknown hand side {side!r}")
+    values = np.asarray(orientation_wxyz, dtype=np.float64)
+    if values.ndim != 2 or values.shape[1] != 4:
+        raise ValueError("orientation_wxyz must be (T,4)")
+    source = Rotation.from_quat(values[:, [1, 2, 3, 0]]).as_matrix()
+    target = source @ _SMPLX_TO_WUJI_PALM[side]
+    xyzw = Rotation.from_matrix(target).as_quat()
+    return xyzw[:, [3, 0, 1, 2]].astype(np.float32)
+
 
 def _pose7(translation: np.ndarray, orientation: np.ndarray) -> np.ndarray:
     return np.concatenate([translation, orientation], axis=1).astype(np.float32)
@@ -63,19 +87,22 @@ def prepare(
     frames = sequence.num_frames
     identity = np.tile(np.array([1, 0, 0, 0], dtype=np.float32), (frames, 1))
     zeros = np.zeros((frames, 3), dtype=np.float32)
-    def hand_values(hand):
+    def hand_values(side: str, hand):
         if hand is None:
             return _pose7(zeros, identity), np.concatenate([np.zeros((frames, 5, 3), dtype=np.float32), np.tile(identity[:, None], (1, 5, 1))], axis=2)
-        tips = hand.joints_world[:, [4, 8, 12, 16, 20], :]
-        return _pose7(hand.global_translation, hand.global_orientation), np.concatenate([tips, np.tile(hand.global_orientation[:, None], (1, 5, 1))], axis=2)
-    wrist_right, finger_right = hand_values(sequence.right_hand)
-    wrist_left, finger_left = hand_values(sequence.left_hand)
+        if tuple(hand.joint_names[index] for index in _FINGERTIP_INDICES) != tuple(f"{name}_tip" for name in _FINGERS):
+            raise ValueError(f"Canonical {side} hand has an invalid fingertip mapping")
+        tips = hand.joints_world[:, _FINGERTIP_INDICES, :]
+        wrist_orientation = canonical_to_wuji_wrist_orientation(side, hand.global_orientation)
+        return _pose7(hand.global_translation, wrist_orientation), np.concatenate([tips, np.tile(wrist_orientation[:, None], (1, 5, 1))], axis=2)
+    wrist_right, finger_right = hand_values("right", sequence.right_hand)
+    wrist_left, finger_left = hand_values("left", sequence.left_hand)
     object_right = _pose7(object_item.translation, object_item.orientation)
     object_left = _pose7(zeros, identity)
     np.savez_compressed(mano_dir / "trajectory_keypoints.npz", qpos_wrist_right=wrist_right, qpos_finger_right=finger_right, qpos_wrist_left=wrist_left, qpos_finger_left=finger_left, qpos_obj_right=object_right, qpos_obj_left=object_left, source_frame_indices=np.asarray(sequence.source_metadata["source_frame_indices"], dtype=np.int64))
     mesh_rel = str(mesh_dir.relative_to(paths.workspace_root))
     run_config = {"sequence_id": sequence.sequence_id, "source_sequence_id": sequence.source_sequence_id, "frame_range": [frame_start, frame_end], "data_id": data_id, "embodiment": embodiment, "robot_type": "wuji_hand2_beta1"}
-    task_info = {"task": task, "dataset_name": "grab", "robot_type": "mano", "embodiment_type": embodiment, "data_id": data_id, "right_object_mesh_dir": mesh_rel, "left_object_mesh_dir": None, "right_object_convex_dir": None, "left_object_convex_dir": None, "ref_dt": 1.0 / sequence.fps, "n_frames": frames, "source_sequence_id": sequence.source_sequence_id, "source_frame_indices": sequence.source_metadata["source_frame_indices"], "canonical_dir": str(canonical_dir), "config_hash": config_hash(run_config), "compatibility_missing_hand_zero_fill": embodiment != "bimanual"}
+    task_info = {"task": task, "dataset_name": "grab", "robot_type": "mano", "embodiment_type": embodiment, "data_id": data_id, "right_object_mesh_dir": mesh_rel, "left_object_mesh_dir": None, "right_object_convex_dir": None, "left_object_convex_dir": None, "ref_dt": 1.0 / sequence.fps, "n_frames": frames, "source_sequence_id": sequence.source_sequence_id, "source_frame_indices": sequence.source_metadata["source_frame_indices"], "canonical_dir": str(canonical_dir), "config_hash": config_hash(run_config), "compatibility_missing_hand_zero_fill": embodiment != "bimanual", "canonical_to_trajectory_keypoints": {"canonical_joint_order": list(sequence.right_hand.joint_names if sequence.right_hand else sequence.left_hand.joint_names), "fingertip_indices": list(_FINGERTIP_INDICES), "fingertip_names": list(_FINGERS), "wrist_orientation_basis": "SMPL-X wrist to Wuji palm", "right_basis_matrix": _SMPLX_TO_WUJI_PALM["right"].tolist(), "left_basis_matrix": _SMPLX_TO_WUJI_PALM["left"].tolist()}}
     task_info_path = mano_dir.parent / "task_info.json"
     task_info_path.write_text(json.dumps(task_info, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (canonical_dir / "source_manifest.json").write_text(json.dumps({"record": adapter.describe_sequence(sequence_id).to_dict(), "canonical_summary": sequence.summary(), "spider_task": task, "spider_data_id": data_id}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -154,7 +181,9 @@ def run_wuji_ik(paths_config: str, sequence_id: str, data_id: int = 0, save_vide
     (robot_dir / "source_mapping.json").write_text(json.dumps(source_mapping, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (robot_dir / "run_config.json").write_text(json.dumps({"robot_asset": "wuji_hand2_beta1", "embodiment": embodiment, "frequency_hz": frequency, "spider_ik": "ik_fast", "wrist_pos_cost": 10.0, "finger_pos_cost": 1.0, "wrist_init_steps": 200, "finger_init_steps": 300, "config_hash": config_hash({"sequence": task, "embodiment": embodiment, "frequency": frequency})}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     ref_slice = slice(1, -1)
-    tracking: dict[str, list[float]] = {"wrist": [], "thumb": [], "index": [], "middle": [], "ring": [], "pinky": []}
+    tracking: dict[str, dict[str, list[float]]] = {
+        side: {name: [] for name in ("wrist", *_FINGERS)} for side in ("right", "left")
+    }
     data = mujoco.MjData(model)
     hand_refs = (("right", canonical.right_hand), ("left", canonical.left_hand))
     finger_names = ("thumb", "index", "middle", "ring", "pinky")
@@ -163,15 +192,14 @@ def run_wuji_ik(paths_config: str, sequence_id: str, data_id: int = 0, save_vide
         for side, hand in hand_refs:
             if hand is None: continue
             wrist_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, f"{side}_palm")
-            tracking["wrist"].append(float(np.linalg.norm(data.site_xpos[wrist_id] - hand.global_translation[ref_slice][frame])))
-            for name, joint_index in zip(finger_names, (4, 8, 12, 16, 20), strict=True):
+            tracking[side]["wrist"].append(float(np.linalg.norm(data.site_xpos[wrist_id] - hand.global_translation[ref_slice][frame])))
+            for name, joint_index in zip(_FINGERS, _FINGERTIP_INDICES, strict=True):
                 site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, f"{side}_{name}_tip")
-                tracking[name].append(float(np.linalg.norm(data.site_xpos[site_id] - hand.joints_world[ref_slice][frame, joint_index])))
-    tracking_summary = {name: {"mean_m": float(np.mean(values)), "rmse_m": float(np.sqrt(np.mean(np.square(values)))), "p95_m": float(np.percentile(values, 95)), "max_m": float(np.max(values))} for name, values in tracking.items() if values}
+                tracking[side][name].append(float(np.linalg.norm(data.site_xpos[site_id] - hand.joints_world[ref_slice][frame, joint_index])))
+    tracking_summary = {side: {name: {"mean_m": float(np.mean(values)), "rmse_m": float(np.sqrt(np.mean(np.square(values)))), "p95_m": float(np.percentile(values, 95)), "max_m": float(np.max(values))} for name, values in by_name.items() if values} for side, by_name in tracking.items() if any(by_name.values())}
     smoke_config = Path(__file__).parents[2] / "configs" / "project" / "grab_ik_smoke.yaml"
     quality = yaml.safe_load(smoke_config.read_text(encoding="utf-8"))["quality"]
-    worst_fingertip_rmse = max(item["rmse_m"] for name, item in tracking_summary.items() if name != "wrist")
-    tracking_within_smoke = tracking_summary["wrist"]["rmse_m"] <= quality["wrist_rmse_m"] and worst_fingertip_rmse <= quality["fingertip_rmse_m"]
+    tracking_within_smoke = all(values["wrist"]["rmse_m"] <= quality["wrist_rmse_m"] and all(values[name]["rmse_m"] <= quality["fingertip_rmse_m"] for name in _FINGERS) for values in tracking_summary.values())
     status = "PASS" if violations == 0 else "OUTPUT_VALIDATION_FAILED"
     quality_status = "AUTO_PIPELINE_PASS" if tracking_within_smoke else "AUTO_PIPELINE_PASS_MANUAL_REVIEW_REQUIRED"
     metrics = {"status": status, "quality_status": quality_status, "frames": int(qpos.shape[0]), "qpos_dimension": int(qpos.shape[1]), "qvel_dimension": int(qvel.shape[1]), "model_nq": int(model.nq), "model_nv": int(model.nv), "model_nu": int(model.nu), "frequency_hz": frequency, "joint_limit_violations": violations, "minimum_joint_limit_margin_rad": min(margins) if margins else None, "maximum_velocity": float(np.abs(qvel).max()), "maximum_acceleration": float(np.abs(np.diff(qvel, axis=0) * frequency).max()) if len(qvel) > 1 else 0.0, "actuator_names": names, "source_frame_mapping_complete": len(source_mapping["source_frame_indices"]) == qpos.shape[0], "tracking_smoke_thresholds": quality, "tracking_errors": tracking_summary, "ik_replay": str(robot_dir / "visualization_ik.mp4")}

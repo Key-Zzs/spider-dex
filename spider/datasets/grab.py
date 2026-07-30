@@ -20,6 +20,24 @@ _HAND_JOINTS = {
     "right": (21, 52, 53, 54, 71, 40, 41, 42, 72, 43, 44, 45, 73, 49, 50, 51, 74, 46, 47, 48, 75),
 }
 _HAND_NAMES = ("wrist", "thumb1", "thumb2", "thumb3", "thumb_tip", "index1", "index2", "index3", "index_tip", "middle1", "middle2", "middle3", "middle_tip", "ring1", "ring2", "ring3", "ring_tip", "pinky1", "pinky2", "pinky3", "pinky_tip")
+_FINGERTIP_INDICES = (4, 8, 12, 16, 20)
+_FINGERTIP_NAMES = ("thumb_tip", "index_tip", "middle_tip", "ring_tip", "pinky_tip")
+
+
+def validate_canonical_hand_order(joint_names: tuple[str, ...]) -> None:
+    """Reject a hand skeleton unless its 21 joints have the public contract order.
+
+    The numerical values alone cannot reveal a swapped finger stream.  Keep the
+    source-to-IK ordering explicit so canonical, SPIDER and MuJoCo mappings can
+    be checked independently.
+    """
+    if joint_names != _HAND_NAMES:
+        raise ValueError(
+            "GRAB canonical hand order must be wrist; thumb/index/middle/ring/"
+            f"pinky chains, got {joint_names!r}"
+        )
+    if tuple(joint_names[index] for index in _FINGERTIP_INDICES) != _FINGERTIP_NAMES:
+        raise ValueError("GRAB canonical fingertip indices must be [4, 8, 12, 16, 20]")
 
 
 def _safe_id(value: str) -> str:
@@ -123,7 +141,10 @@ class GrabAdapter(DatasetAdapter):
         except ImportError as exc:
             raise RuntimeError("GRAB SMPL-X reconstruction requires the 'smplx' package") from exc
         count = end - start
-        model = smplx.create(str(self.paths.body_model_root), model_type="smplx", gender=gender, use_pca=True, num_pca_comps=24, flat_hand_mean=True, batch_size=count)
+        # GRAB's stored body.fullpose is decoded with the SMPL-X hand mean.
+        # ``flat_hand_mean=True`` changes every PCA hand pose; on s1/mug_lift
+        # it disagreed with the source fullpose by 0.142 rad on average.
+        model = smplx.create(str(self.paths.body_model_root), model_type="smplx", gender=gender, use_pca=True, num_pca_comps=24, flat_hand_mean=False, batch_size=count)
         tensor = lambda value: torch.as_tensor(np.asarray(value[index]), dtype=torch.float32)
         with torch.no_grad():
             output = model(global_orient=tensor(body["global_orient"]), body_pose=tensor(body["body_pose"]), left_hand_pose=tensor(body["left_hand_pose"]), right_hand_pose=tensor(body["right_hand_pose"]), jaw_pose=tensor(body["jaw_pose"]), leye_pose=tensor(body["leye_pose"]), reye_pose=tensor(body["reye_pose"]), expression=tensor(body["expression"]), transl=tensor(body["transl"]), betas=torch.as_tensor(np.repeat(betas[None], count, axis=0), dtype=torch.float32), return_verts=include_vertices, return_full_pose=True)
@@ -152,12 +173,13 @@ class GrabAdapter(DatasetAdapter):
             # The standalone GRAB hand translation is the MANO model origin,
             # not necessarily the anatomical wrist center. Use the reconstructed
             # SMPL-X wrist to keep the canonical wrist and joints co-located.
+            validate_canonical_hand_order(_HAND_NAMES)
             return HandSequence(side=side, valid_mask=np.ones(count, dtype=bool), global_translation=joints[:, indices[0], :], global_orientation=wrist_orientations[side], mano_pose=np.asarray(params["hand_pose"][index], dtype=np.float32), mano_shape=betas, joints_world=joints[:, indices, :], joint_names=_HAND_NAMES, pose_representation="PCA24_axis_angle_root", model_type="SMPL-X", model_gender=gender, vertices_world=hand_vertices[side])
 
         mesh = self.source_root / object_mesh_relative
         if not mesh.is_file():
             mesh = self.resolve_object_mesh(obj_name)
         source_rel = path.relative_to(self.source_root).as_posix()
-        canonical = CanonicalHOISequence(dataset_name=self.dataset_name, sequence_id=_safe_id(sequence_id), source_sequence_id=sequence_id.replace("__", "/"), fps=fps, timestamps=np.arange(start, end, dtype=np.float64) / fps, coordinate_system={"world_frame": "GRAB SMPL-X global mocap world", "axis_convention": "right-handed source XYZ", "handedness": "right", "rotation_representation": "wxyz", "quaternion_order": "wxyz", "source_to_canonical_transform": "identity; source SMPL-X outputs are metres"}, length_unit="m", right_hand=make_hand("right", right), left_hand=make_hand("left", left), objects=[ObjectSequence(object_id=_safe_id(obj_name), object_name=obj_name, mesh_path=object_mesh_relative, valid_mask=np.ones(count, dtype=bool), translation=np.asarray(object_params["transl"][index], dtype=np.float32), orientation=_wxyz(object_params["global_orient"][index]), scale=np.ones(3, dtype=np.float32), source_metadata={"source_relative_mesh_path": object_mesh_relative, "resolved_local_mesh_path": str(mesh.resolve())})], primary_object_id=_safe_id(obj_name), source_metadata={"source_relative_path": source_rel, "resolved_local_path": str(path.resolve()), "subject_id": subject_id, "gender": gender, "source_frame_indices": list(range(start, end)), "motion_intent": "recorded"}, provenance={"source_dataset": "GRAB", "source_file_relative_path": source_rel, "source_file_sha256": sha256_file(path), "source_file_size": path.stat().st_size, "source_file_mtime_ns": path.stat().st_mtime_ns, "body_model_type": "SMPL-X", "body_model_source": "local_config.body_models.root", "body_model_beta_relative_path": beta_path.relative_to(self.source_root).as_posix(), "mano_pca_components": ncomps, "flat_hand_mean": True, "creation_environment": "spider-dex"})
+        canonical = CanonicalHOISequence(dataset_name=self.dataset_name, sequence_id=_safe_id(sequence_id), source_sequence_id=sequence_id.replace("__", "/"), fps=fps, timestamps=np.arange(start, end, dtype=np.float64) / fps, coordinate_system={"world_frame": "GRAB SMPL-X global mocap world", "axis_convention": "right-handed source XYZ", "handedness": "right", "rotation_representation": "wxyz", "quaternion_order": "wxyz", "source_to_canonical_transform": "identity; source SMPL-X outputs are metres"}, length_unit="m", right_hand=make_hand("right", right), left_hand=make_hand("left", left), objects=[ObjectSequence(object_id=_safe_id(obj_name), object_name=obj_name, mesh_path=object_mesh_relative, valid_mask=np.ones(count, dtype=bool), translation=np.asarray(object_params["transl"][index], dtype=np.float32), orientation=_wxyz(object_params["global_orient"][index]), scale=np.ones(3, dtype=np.float32), source_metadata={"source_relative_mesh_path": object_mesh_relative, "resolved_local_mesh_path": str(mesh.resolve())})], primary_object_id=_safe_id(obj_name), source_metadata={"source_relative_path": source_rel, "resolved_local_path": str(path.resolve()), "subject_id": subject_id, "gender": gender, "source_frame_indices": list(range(start, end)), "motion_intent": "recorded"}, provenance={"source_dataset": "GRAB", "source_file_relative_path": source_rel, "source_file_sha256": sha256_file(path), "source_file_size": path.stat().st_size, "source_file_mtime_ns": path.stat().st_mtime_ns, "body_model_type": "SMPL-X", "body_model_source": "local_config.body_models.root", "body_model_beta_relative_path": beta_path.relative_to(self.source_root).as_posix(), "mano_pca_components": ncomps, "flat_hand_mean": False, "creation_environment": "spider-dex"})
         canonical.validate()
         return canonical

@@ -16,6 +16,8 @@ from spider.datasets.manifest import config_hash, write_manifest
 from spider.datasets.paths import ProjectPaths, load_project_paths
 from spider.datasets.registry import DatasetRegistry
 from spider.datasets.schema import CanonicalHOISequence, HandSequence, ObjectSequence
+from spider.datasets.grab import validate_canonical_hand_order
+from spider.tools.grab_pipeline import canonical_to_wuji_wrist_orientation
 
 
 def _coordinates() -> dict[str, object]:
@@ -130,6 +132,19 @@ class CanonicalSchemaTest(unittest.TestCase):
         sequence = _sequence(); sequence.right_hand.joints_world[0, 0, 0] = np.nan
         with self.assertRaisesRegex(ValueError, "NaN or Inf"):
             sequence.validate()
+
+    def test_grab_joint_order_and_wuji_wrist_basis_are_explicit(self):
+        names = (
+            "wrist", "thumb1", "thumb2", "thumb3", "thumb_tip", "index1", "index2", "index3", "index_tip", "middle1", "middle2", "middle3", "middle_tip", "ring1", "ring2", "ring3", "ring_tip", "pinky1", "pinky2", "pinky3", "pinky_tip",
+        )
+        validate_canonical_hand_order(names)
+        with self.assertRaisesRegex(ValueError, "canonical hand order"):
+            validate_canonical_hand_order(tuple(reversed(names)))
+        source = np.tile(np.array([1.0, 0.0, 0.0, 0.0]), (2, 1))
+        for side in ("right", "left"):
+            target = canonical_to_wuji_wrist_orientation(side, source)
+            self.assertEqual(target.shape, (2, 4))
+            self.assertTrue(np.allclose(np.linalg.norm(target, axis=1), 1.0))
 
 
 if __name__ == "__main__":

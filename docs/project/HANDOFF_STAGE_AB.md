@@ -28,10 +28,11 @@ selected subject, subject gender/betas, ContactDB object meshes, and source
 world-space body/object transforms. The concrete pilot manifest is
 `<workspace>/manifests/grab_pilot.json`.
 
-Primary: `s1/mug_lift`, frames `[120,240)`, source replay at
-`<workspace>/processed/grab/canonical/s1__mug_lift/visualization/source_replay.mp4`,
-IK replay/metrics at
-`<workspace>/processed/grab/wuji_hand2_beta1/bimanual/s1__mug_lift/0/`.
+Primary: `s5/cylindermedium_lift`, frames `[1460,1876)`, selected and frozen
+from source-only real-mesh surface-distance metrics. Source replay is at
+`<workspace>/processed/grab/canonical/s5__cylindermedium_lift/visualization/source_replay.mp4`;
+IK replay/metrics are at
+`<workspace>/processed/grab/wuji_hand2_beta1/bimanual/s5__cylindermedium_lift/0/`.
 
 ## Commands
 
@@ -46,8 +47,7 @@ conda run -n spider-dex python -m spider.tools.report_stage_ab --paths-config co
 ## Limitations and next gate
 
 No physics optimization, contact/penetration tuning, batch conversion, OakInk,
-or real robot work occurred. The generated pilots have valid trajectories and
-videos but exceed fixed fingertip tracking smoke thresholds, so their quality
-status is `AUTO_PIPELINE_PASS_MANUAL_REVIEW_REQUIRED`. Stage B manual
-acceptance remains pending. Do not enter Stage C until the user reviews
-`MANUAL_ACCEPTANCE_GRAB_WUJI.md` and explicitly passes it.
+or real robot work occurred. The frozen pilots pass the fixed per-side
+thresholds. Codex screenshot acceptance is recorded in
+`<workspace>/reports/stage_b_acceptance.json`; do not enter Stage C as part of
+this task.

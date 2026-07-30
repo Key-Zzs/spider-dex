@@ -19,10 +19,11 @@ conda run -n spider-dex python -m spider.tools.grab_pipeline run-wuji-ik \
 ```
 
 The post-run validator writes source-frame mapping, config, named actuators,
-joint-limit/continuity metrics, and tracking statistics. The tracked smoke
-threshold config deliberately reports an executable trajectory with excessive
-tracking error as `AUTO_PIPELINE_PASS_MANUAL_REVIEW_REQUIRED` rather than
-silently widening thresholds.
+joint-limit/continuity metrics, and separate `right`/`left` wrist and five-tip
+tracking statistics. The fixed thresholds are checked for every side and
+finger, so averaging cannot hide a bad hand. GRAB body PCA is decoded with
+`flat_hand_mean=False`, verified against its stored `body.fullpose`, before
+the explicit SMPL-X-wrist-to-Wuji-palm asset-frame basis conversion.
 
 For manual acceptance, generate `grab_interactive_viewer source` and
 `grab_interactive_viewer wuji`. These are self-contained Plotly HTML files with
