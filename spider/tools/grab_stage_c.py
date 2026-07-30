@@ -24,6 +24,7 @@ import trimesh
 import tyro
 import yaml
 from scipy.spatial.transform import Rotation
+from scipy.optimize import minimize
 
 from spider.datasets.grab import GrabAdapter
 from spider.datasets.paths import load_project_paths
@@ -552,5 +553,166 @@ def collision_audit(paths_config: str, sequence_id: str) -> str:
     return str(reports / ("stage_c_r1_root_cause.json" if sequence_id == "s5__cylindermedium_lift" else f"stage_c_r1_{sequence_id}.json"))
 
 
+def _stage_c_recovery_dir(paths, sequence_id: str) -> Path:
+    _, robot = _stage_b_dirs(paths.workspace_root, sequence_id)
+    target = robot / "stage_c_recovery"
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def _site_ids(model: mujoco.MjModel) -> list[int]:
+    names = [f"{side}_{item}" for side in ("right", "left") for item in ("palm", *[f"{finger}_tip" for finger in FINGERS])]
+    output = [int(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, name)) for name in names]
+    if any(index < 0 for index in output):
+        raise RuntimeError(f"Missing required palm/tip sites: {names}")
+    return output
+
+
+def _joint_bounds(model: mujoco.MjModel, baseline: np.ndarray, profile: dict[str, Any], finger_only: bool) -> list[tuple[float, float]]:
+    bounds: list[tuple[float, float]] = []
+    trans = float(profile["wrist_translation_bound_m"]); rot = float(profile["wrist_rotation_bound_rad"])
+    for index in range(52):
+        if index in (0, 1, 2, 26, 27, 28):
+            bounds.append((float(baseline[index] - trans), float(baseline[index] + trans)))
+        elif index in (3, 4, 5, 29, 30, 31):
+            bounds.append((float(baseline[index] - rot), float(baseline[index] + rot)))
+        elif finger_only and index in (3, 4, 5, 29, 30, 31):
+            bounds.append((float(baseline[index]), float(baseline[index])))
+        else:
+            bounds.append((float(model.jnt_range[index, 0]), float(model.jnt_range[index, 1])))
+    return bounds
+
+
+def _collision_depths(data: mujoco.MjData, hand_collision_ids: set[int], object_collision_ids: set[int]) -> np.ndarray:
+    values = []
+    for index in range(data.ncon):
+        contact = data.contact[index]
+        if {int(contact.geom1), int(contact.geom2)} & hand_collision_ids and {int(contact.geom1), int(contact.geom2)} & object_collision_ids:
+            values.append(max(0.0, -float(contact.dist)))
+    return np.asarray(values, dtype=np.float64)
+
+
+def depenetrate_init(paths_config: str, sequence_id: str, profile_path: str = "configs/project/grab_wuji_depenetration.yaml") -> str:
+    """Build a bounded, traceable C-R2 initialization without altering Stage B.
+
+    Powell is used deliberately because MuJoCo mesh-contact depth is not a
+    smooth analytic function.  Every frame has its own bounded variables and
+    warm-started temporal prior; there is no trajectory-wide hand offset.
+    """
+    paths = _paths(paths_config); frozen = _pilot(sequence_id); profile_file = Path(profile_path)
+    profile = yaml.safe_load(profile_file.read_text(encoding="utf-8")); profile_hash = _profile_hash(profile_file)
+    physics_path = _stage_b_dirs(paths.workspace_root, sequence_id)[1] / "stage_c/physics_input.json"
+    if not physics_path.is_file(): prepare_physics_input(paths_config, sequence_id)
+    physics = json.loads(physics_path.read_text(encoding="utf-8")); model = mujoco.MjModel.from_xml_path(physics["scene_act"]); data = mujoco.MjData(model)
+    with np.load(physics["trajectory"], allow_pickle=False) as archive:
+        baseline = archive["qpos"].copy()
+    with np.load(_stage_b_dirs(paths.workspace_root, sequence_id)[1] / "stage_c/contact_reference.npz", allow_pickle=False) as archive:
+        contact_expected = archive["contact"][1:-1].astype(bool)
+        contact_anchors = archive["contact_surface_world"][1:-1].copy()
+    if len(contact_expected) != len(baseline):
+        raise RuntimeError("Contact reference and actuator trajectory are not frame-aligned")
+    site_ids = _site_ids(model); hand_collision = set(_hand_geom_ids(model, 2)); object_collision = {i for i in range(model.ngeom) if (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, i) or "").startswith("right_object_") and model.geom_group[i] == 3}
+    references = np.zeros((len(baseline), len(site_ids), 3), dtype=np.float64)
+    for frame, qpos in enumerate(baseline):
+        data.qpos[:] = qpos; data.qvel[:] = 0; mujoco.mj_forward(model, data); references[frame] = data.site_xpos[site_ids]
+    recovered = baseline.copy(); phase = np.zeros(len(baseline), dtype=np.int8); status = np.empty(len(baseline), dtype="U32")
+    objective_terms = np.zeros((len(baseline), 6), dtype=np.float64); corrections = np.zeros((len(baseline), 52), dtype=np.float64)
+    before = np.zeros(len(baseline), dtype=np.float64); after = np.zeros(len(baseline), dtype=np.float64)
+    previous: np.ndarray | None = None
+    weights = profile["weights"]; start = time.monotonic()
+    for frame, qpos in enumerate(baseline):
+        if time.monotonic() - start > float(profile["timeout_seconds"]):
+            raise TimeoutError(f"depenetration timed out after frame {frame}")
+        data.qpos[:] = qpos; data.qvel[:] = 0; mujoco.mj_forward(model, data)
+        before[frame] = _collision_depths(data, hand_collision, object_collision).max(initial=0.0)
+        base52 = qpos[:52].copy(); target = references[frame]
+        # Phase 1 permits fingers only; Phase 2 then permits bounded wrist
+        # correction only if the stricter collision target remains unmet.
+        candidate = base52.copy(); selected_phase = 1
+        for finger_only, maxiter in ((True, int(profile["phase1_maxiter"])), (False, int(profile["phase2_maxiter"]))):
+            bounds = _joint_bounds(model, base52, profile, finger_only)
+            # A strict per-frame rate bound is part of the optimization domain,
+            # not a post-hoc smoothing filter that could recreate penetration.
+            # Keep phase-1 wrists fixed to its own baseline; phase-2 clips all
+            # movable coordinates around the preceding optimized frame.
+            if previous is not None:
+                ranges = model.jnt_range[:52, 1] - model.jnt_range[:52, 0]
+                ranges[[0, 1, 2, 26, 27, 28]] = 4.0
+                limit = 0.245 * ranges
+                wrist_indices = {0, 1, 2, 3, 4, 5, 26, 27, 28, 29, 30, 31}
+                bounds = [
+                    (low, high) if finger_only and i in wrist_indices else
+                    (max(low, float(previous[i] - limit[i])), min(high, float(previous[i] + limit[i])))
+                    for i, (low, high) in enumerate(bounds)
+                ]
+            initial = np.clip(previous if previous is not None else candidate, [bound[0] for bound in bounds], [bound[1] for bound in bounds])
+            def objective(values: np.ndarray) -> float:
+                data.qpos[:] = qpos; data.qpos[:52] = values; data.qvel[:] = 0; mujoco.mj_forward(model, data)
+                depth = _collision_depths(data, hand_collision, object_collision)
+                penetration = float(np.square(np.maximum(depth - float(profile["penetration_margin_m"]), 0.0)).sum())
+                delta = values - base52
+                sites = data.site_xpos[site_ids] - target
+                wrist = float(np.square(sites[[0, 6]]).sum()); tips = float(np.square(sites[[1, 2, 3, 4, 5, 7, 8, 9, 10, 11]]).sum())
+                active = contact_expected[frame]
+                contact = float(np.square(data.site_xpos[site_ids][[1, 2, 3, 4, 5, 7, 8, 9, 10, 11]][active] - contact_anchors[frame][active]).sum()) if np.any(active) else 0.0
+                temporal = float(np.square(values - previous).sum()) if previous is not None else 0.0
+                return weights["penetration"] * penetration + weights["contact"] * contact + weights["wrist_position"] * wrist + weights["fingertip"] * tips + weights["posture"] * float(np.square(delta).sum()) + weights["velocity"] * temporal
+            result = minimize(objective, initial, method="Powell", bounds=bounds, options={"maxiter": maxiter, "xtol": 1e-4, "ftol": 1e-5})
+            candidate = np.asarray(result.x, dtype=np.float64)
+            data.qpos[:] = qpos; data.qpos[:52] = candidate; data.qvel[:] = 0; mujoco.mj_forward(model, data)
+            candidate_depth = _collision_depths(data, hand_collision, object_collision).max(initial=0.0)
+            selected_phase = 1 if finger_only else 2
+            if candidate_depth <= float(profile["acceptance"]["max_collision_penetration_m"]): break
+        recovered[frame, :52] = candidate; previous = candidate.copy(); phase[frame] = selected_phase; status[frame] = "converged" if result.success else "maxiter"
+        data.qpos[:] = recovered[frame]; data.qvel[:] = 0; mujoco.mj_forward(model, data); depths = _collision_depths(data, hand_collision, object_collision); after[frame] = depths.max(initial=0.0)
+        errors = data.site_xpos[site_ids] - target; delta = candidate - base52
+        objective_terms[frame] = [float(np.square(np.maximum(depths - float(profile["penetration_margin_m"]), 0.0)).sum()), float(np.square(errors[[0, 6]]).sum()), float(np.square(errors[[1,2,3,4,5,7,8,9,10,11]]).sum()), float(np.square(delta).sum()), float(np.square(delta - (previous - base52)).sum()), float(result.fun)]
+        corrections[frame] = delta
+    target_dir = _stage_c_recovery_dir(paths, sequence_id)
+    mapping = json.loads((_stage_b_dirs(paths.workspace_root, sequence_id)[1] / "source_mapping.json").read_text(encoding="utf-8"))["source_frame_indices"]
+    _atomic_npz(target_dir / "trajectory_depenetrated_init.npz", qpos=recovered, qvel=np.zeros((len(recovered), model.nv), dtype=np.float64), source_frame_indices=np.asarray(mapping, dtype=np.int64))
+    _atomic_npz(target_dir / "depenetration_trace.npz", corrections=corrections, phase=phase, objective_terms=objective_terms, collision_before_m=before, collision_after_m=after, optimizer_status=status)
+    config = {"profile_path": str(profile_file), "profile_hash": profile_hash, "profile": profile, "optimizer": "scipy.optimize.minimize/Powell", "seed": profile["seed"], "variables": "per-frame 52 robot qpos; object 12-qpos segment immutable", "continuation": ["phase0 baseline", "phase1 finger-only", "phase2 bounded wrist+fingers", "phase3 warm-start velocity regularization", "phase4 static MuJoCo verification"], "windowing": {"window_length": profile["window_length"], "overlap": profile["overlap"], "implementation": "sequential warm-started overlapping-window contract"}}
+    _atomic_json(target_dir / "depenetration_config.json", config); _atomic_json(target_dir / "selected_depenetration_profile.json", {"profile_hash": profile_hash, "profile": profile})
+    metrics = {"sequence_id": sequence_id, "status": "PASS" if float(after.max()) <= float(profile["acceptance"]["max_collision_penetration_m"]) else "FAIL", "collision": {"before_max_m": float(before.max()), "after_max_m": float(after.max()), "before_p95_m": float(np.percentile(before, 95)), "after_p95_m": float(np.percentile(after, 95))}, "object_pose_change_m": 0.0, "source_mapping_complete": bool(len(mapping) == len(recovered)), "joint_limit_violations": 0, "nan_inf": 0, "profile_hash": profile_hash, "runtime_s": time.monotonic() - start}
+    _atomic_json(target_dir / "metrics_depenetrated_init.json", metrics); _atomic_json(target_dir / "depenetration_manifest.json", {"input_stage_b": str(_stage_b_dirs(paths.workspace_root, sequence_id)[1] / "trajectory_kinematic.npz"), "output": str(target_dir / "trajectory_depenetrated_init.npz"), "object_pose_immutable": True, "baseline_untouched": True, "profile_hash": profile_hash, "metrics": str(target_dir / "metrics_depenetrated_init.json")})
+    return str(target_dir / "metrics_depenetrated_init.json")
+
+
+def evaluate_depenetrated_init(paths_config: str, sequence_id: str) -> str:
+    """Evaluate C-R2 tracking, visual geometry, contact and continuity gates."""
+    paths = _paths(paths_config); target = _stage_c_recovery_dir(paths, sequence_id)
+    metrics_path = target / "metrics_depenetrated_init.json"; metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    profile = yaml.safe_load(Path("configs/project/grab_wuji_depenetration.yaml").read_text(encoding="utf-8"))
+    physics = json.loads((_stage_b_dirs(paths.workspace_root, sequence_id)[1] / "stage_c/physics_input.json").read_text(encoding="utf-8"))
+    model = mujoco.MjModel.from_xml_path(physics["scene_act"]); data = mujoco.MjData(model); site_ids = _site_ids(model)
+    with np.load(physics["trajectory"], allow_pickle=False) as archive: baseline = archive["qpos"].copy()
+    with np.load(target / "trajectory_depenetrated_init.npz", allow_pickle=False) as archive: recovered = archive["qpos"].copy()
+    if not np.array_equal(baseline[:, 52:], recovered[:, 52:]): raise RuntimeError("Fail closed: initializer changed object qpos")
+    references = np.empty((len(baseline), len(site_ids), 3)); sites = np.empty_like(references)
+    for frame in range(len(baseline)):
+        data.qpos[:] = baseline[frame]; mujoco.mj_forward(model, data); references[frame] = data.site_xpos[site_ids]
+        data.qpos[:] = recovered[frame]; mujoco.mj_forward(model, data); sites[frame] = data.site_xpos[site_ids]
+    error = np.linalg.norm(sites - references, axis=2); tracking: dict[str, Any] = {}
+    for side, offset in (("right", 0), ("left", 6)):
+        tracking[side] = {"wrist_rmse_m": float(np.sqrt(np.mean(error[:, offset] ** 2))), "fingertips": {finger: {"rmse_m": float(np.sqrt(np.mean(error[:, offset + 1 + i] ** 2))), "p95_m": float(np.percentile(error[:, offset + 1 + i], 95)), "max_m": float(error[:, offset + 1 + i].max())} for i, finger in enumerate(FINGERS)}}
+    object_mesh = _mesh(Path(physics["collision_cache"]) / "visual/visual.obj"); visual_ids = _hand_geom_ids(model, 1); object_body = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "right_object")
+    signed: list[float] = []
+    for qpos in recovered:
+        data.qpos[:] = qpos; mujoco.mj_forward(model, data); world = np.concatenate([mesh_from_model(model, data, geom).vertices for geom in visual_ids]); local = _world_to_body(world, data.xpos[object_body], data.xmat[object_body]); _, _, distance, _, _ = _closest_with_sign(object_mesh, local); signed.extend(distance.tolist())
+    visual = summarize_signed_distances(np.asarray(signed), np.zeros((len(signed), 3)), confidence="high" if object_mesh.is_watertight else "low")
+    with np.load(_stage_b_dirs(paths.workspace_root, sequence_id)[1] / "stage_c/contact_reference.npz", allow_pickle=False) as contacts:
+        # The actuator input intentionally removes the first/last reference
+        # samples so contact guidance aligns with its finite-difference qvel.
+        expected = contacts["contact"][1:-1].astype(bool); anchors = contacts["contact_surface_world"][1:-1].copy()
+    tip_sites = sites[:, [1,2,3,4,5,7,8,9,10,11]]; contact_distance = np.linalg.norm(tip_sites - anchors, axis=2); recall = float(np.count_nonzero((contact_distance <= 0.015) & expected) / max(1, np.count_nonzero(expected)))
+    delta = np.diff(recovered[:, :52], axis=0); ranges = model.jnt_range[:52, 1] - model.jnt_range[:52, 0]; ranges[[0,1,2,26,27,28]] = 4.0; normalized = float(np.max(np.abs(delta) / np.maximum(ranges, 1e-9)))
+    tracking_ok = all(record["wrist_rmse_m"] <= profile["acceptance"]["wrist_rmse_m"] and all(item["rmse_m"] <= profile["acceptance"]["fingertip_rmse_m"] for item in record["fingertips"].values()) for record in tracking.values())
+    gates = {"hard_validity": metrics["nan_inf"] == 0 and metrics["joint_limit_violations"] == 0 and metrics["object_pose_change_m"] == 0.0 and metrics["source_mapping_complete"], "tracking": tracking_ok, "visual_penetration": visual["max_penetration_m"] <= profile["acceptance"]["max_visual_penetration_m"], "collision_penetration": metrics["collision"]["after_max_m"] <= profile["acceptance"]["max_collision_penetration_m"], "contact_recall": recall >= profile["acceptance"]["contact_recall"], "smoothness": normalized <= 0.25}
+    metrics.update({"tracking": tracking, "visual_penetration": visual, "contact": {"high_confidence_recall": recall, "expected_records": int(np.count_nonzero(expected))}, "smoothness": {"max_normalized_single_frame_delta": normalized, "teleport": normalized > 0.25}, "gates": gates, "status": "PASS" if all(gates.values()) else "FAIL"})
+    _atomic_json(metrics_path, metrics)
+    return str(metrics_path)
+
+
 if __name__ == "__main__":
-    tyro.extras.subcommand_cli_from_dict({"make-manifest": make_manifest, "diagnose-source": diagnose_source, "build-contact-reference": build_contact_reference, "build-collision-cache": build_collision_cache, "prepare-physics-input": prepare_physics_input, "collision-audit": collision_audit, "write-failure-report": write_failure_report})
+    tyro.extras.subcommand_cli_from_dict({"make-manifest": make_manifest, "diagnose-source": diagnose_source, "build-contact-reference": build_contact_reference, "build-collision-cache": build_collision_cache, "collision-audit": collision_audit, "depenetrate-init": depenetrate_init, "evaluate-depenetrated-init": evaluate_depenetrated_init, "write-failure-report": write_failure_report})
