@@ -54,6 +54,12 @@ conda run -n spider-dex python examples/inspect_wuji_hand2.py --side left --mode
 conda run -n spider-dex python examples/inspect_wuji_hand2.py --side bimanual --mode sweep --show-collision --show-sites
 ```
 
+`sweep` keeps wrist controls neutral and pulses all four joints of one finger
+at a time.  In bimanual mode it alternates the active hand once per second, so
+each hand is visibly exercised while the other remains neutral.  The default
+ten-second duration completes one five-finger cycle for each hand; pass, for
+example, `--duration 20` for a longer inspection.
+
 Right hand checklist:
 
 - [ ] It is a right hand, with correct palm orientation and finger ordering.
@@ -70,7 +76,8 @@ Left hand checklist:
 Bimanual checklist:
 
 - [ ] Both hands render without duplicate-name warnings.
-- [ ] Sweeping the right control segment leaves the left side still, and vice versa.
+- [ ] Both control segments are exercised: the active hand moves while the
+      other hand remains still, then the roles alternate.
 - [ ] Camera/scene behavior is sensible; no jump, explosion, or unexpected coupling occurs.
 
 Do not mark the complete S2 acceptance as finished until this checklist has been
