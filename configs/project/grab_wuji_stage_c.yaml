@@ -1,0 +1,40 @@
+# Frozen shared physics profile for the bounded GRAB -> Wuji Hand2 Stage C pilots.
+# Paths are supplied at runtime from configs/local/paths.yaml and are intentionally
+# absent here so this tracked file stays portable.
+simulator: mjwp
+device: cuda:0
+sim_dt: 0.01
+ref_dt: 0.008333333333333333
+ctrl_dt: 0.05
+horizon: 0.20
+knot_dt: 0.10
+num_samples: 16
+max_num_iterations: 2
+temperature: 0.20
+first_ctrl_noise_scale: 0.20
+last_ctrl_noise_scale: 0.40
+final_noise_scale: 0.10
+exploit_ratio: 0.10
+exploit_noise_scale: 0.01
+joint_noise_scale: 0.06
+pos_noise_scale: 0.010
+rot_noise_scale: 0.010
+base_pos_rew_scale: 1.0
+base_rot_rew_scale: 0.30
+joint_rew_scale: 0.003
+pos_rew_scale: 1.0
+rot_rew_scale: 0.30
+vel_rew_scale: 0.0001
+terminal_rew_scale: 1.0
+contact_rew_scale: 0.15
+contact_guidance: true
+object_action_dims: 12
+pair_margin_range: [-0.002, 0.002]
+object_pos_threshold: 0.03
+object_rot_threshold: 0.20
+base_pos_threshold: 0.03
+base_rot_threshold: 0.30
+sanity_check_seconds: 0.0
+max_local_retries: 2
+max_revert_depth: 2
+seed: 20260730

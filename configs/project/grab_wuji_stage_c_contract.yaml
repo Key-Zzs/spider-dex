@@ -1,0 +1,27 @@
+# Stage C orchestration contract, intentionally separate from the Config-only
+# MJWP profile so examples/run_mjwp.py can load the latter without unknown keys.
+profile_name: grab_wuji_stage_c_v1
+profile_file: configs/project/grab_wuji_stage_c.yaml
+ref_dt_policy: source_fps
+object_density: 1000
+friction_scale: 1.0
+timeout_seconds: 900
+profile_search:
+  max_candidates: 3
+  candidates:
+    - {name: contact_010, contact_rew_scale: 0.10, joint_noise_scale: 0.05}
+    - {name: contact_015, contact_rew_scale: 0.15, joint_noise_scale: 0.06}
+    - {name: contact_020, contact_rew_scale: 0.20, joint_noise_scale: 0.07}
+thresholds:
+  wrist_rmse_m: 0.03
+  fingertip_rmse_m: 0.08
+  visual_max_penetration_m: 0.010
+  visual_p95_penetration_m: 0.005
+  visual_mean_negative_depth_m: 0.002
+  visual_penetrating_vertex_ratio: 0.05
+  contact_distance_m: 0.015
+  contact_recall: 0.70
+  object_pos_rmse_m: 0.03
+  object_pos_max_m: 0.08
+  object_rot_mean_rad: 0.20
+  object_rot_max_rad: 0.50
