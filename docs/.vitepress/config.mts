@@ -44,6 +44,21 @@ const developmentSidebar = [
   },
 ];
 
+const projectSidebar = [
+  {
+    text: 'SPIDER-Dex project',
+    items: [
+      { text: 'Project Index', link: '/project/' },
+      { text: 'Repository Audit', link: '/project/REPOSITORY_AUDIT' },
+      { text: 'Roadmap', link: '/project/ROADMAP' },
+      { text: 'Workflow', link: '/project/WORKFLOW' },
+      { text: 'Wuji Hand2 Beta1', link: '/project/WUJI_HAND2_BETA1' },
+      { text: 'Asset Provenance', link: '/project/ASSET_PROVENANCE' },
+      { text: 'Validation', link: '/project/VALIDATION' },
+    ],
+  },
+];
+
 export default defineConfig({
   lang: 'en-US',
   title: 'SPIDER',
@@ -56,6 +71,7 @@ export default defineConfig({
       { text: 'Usage', link: '/usage/data-structure' },
       { text: 'Workflows', link: '/workflows/workflow-mjwp' },
       { text: 'Development', link: '/development/add-robot' },
+      { text: 'Project', link: '/project/' },
       { text: 'GitHub', link: 'https://github.com/facebookresearch/spider' },
     ],
     sidebar: {
@@ -63,6 +79,7 @@ export default defineConfig({
       '/usage/': usageSidebar,
       '/workflows/': workflowsSidebar,
       '/development/': developmentSidebar,
+      '/project/': projectSidebar,
     },
     socialLinks: [{ icon: 'github', link: 'https://github.com/facebookresearch/spider' }],
   },

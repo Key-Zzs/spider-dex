@@ -34,6 +34,12 @@ features:
     details: Optimized trajectories can be directly deployed to real-world robots with minimal adjustments
 ---
 
+## SPIDER-Dex project
+
+The fork-specific documentation is collected in the
+[project index](project/index.md), including the Wuji Hand2 Beta1 adapter,
+audit, provenance, workflow, and validation status.
+
 ## Quick Example
 
 ```bash

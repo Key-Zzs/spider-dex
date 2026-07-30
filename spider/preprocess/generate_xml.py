@@ -16,6 +16,7 @@ import tyro
 from loop_rate_limiters import RateLimiter
 
 from spider import ROOT
+from spider.assets import ensure_robot_assets
 from spider.io import get_processed_data_dir
 
 
@@ -132,6 +133,11 @@ def main(
         data_id=data_id,
     )
     os.makedirs(processed_dir, exist_ok=True)
+
+    # Robot descriptions are shipped with the package but generated scenes are
+    # stored under the external processed dataset root.  Stage exactly the
+    # requested robot once, with manifest conflict protection.
+    ensure_robot_assets(dataset_dir, dataset_name, robot_type)
 
     # choose robot XML based on embodiment_type
     robots_assets_dir = (

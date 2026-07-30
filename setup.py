@@ -20,7 +20,7 @@ def parse_requirements(path: str) -> list[str]:
 
 
 setup(
-    name="spider",
+    name="spider-dex",
     version="0.1.0",
     description="Add your description here",
     long_description=Path("README.md").read_text(encoding="utf-8"),

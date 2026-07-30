@@ -1,0 +1,14 @@
+robot_type: wuji_hand2_beta1
+schema_version: 1
+current_spider_consumer: null
+purpose: future URDF-based retarget configuration; current SPIDER IK uses MJCF sites
+right:
+  urdf: urdf/right_6dof.urdf
+  root_link: right_wrist_base
+  palm_link: r_wrist
+left:
+  urdf: urdf/left_6dof.urdf
+  root_link: left_wrist_base
+  palm_link: l_wrist
+fingertips:
+  mano_21_indices: {thumb: 4, index: 8, middle: 12, ring: 16, pinky: 20}

@@ -1,0 +1,44 @@
+# Workflow contract
+
+```text
+External HOI datasets
+        | configurable external path
+        v
+Dataset-specific adapter
+        v
+Unified MANO/object trajectory
+        v
+SPIDER keypoint/contact preprocessing
+        v
+Wuji Hand2 Beta1 kinematic IK
+        v
+SPIDER physics-informed optimization
+        +--> visualization
+        +--> metrics
+        +--> downstream export
+```
+
+S2 ends at the target-embodiment boundary. `wuji_hand2_beta1` is an implicit
+asset-directory robot type, not a new global registry. `generate_xml.py` calls
+`ensure_robot_assets()` before loading an adapter, staging exactly one
+manifest-checked robot directory under:
+
+```text
+<dataset-root>/processed/<dataset-name>/assets/robots/wuji_hand2_beta1
+```
+
+The helper copies no data and refuses to overwrite a conflicting staged model.
+Scene generation selects `right.xml`, `left.xml`, or `bimanual.xml` by the
+existing `embodiment_type` convention. The existing IK code consumes palm and
+five-fingertip sites; the adapter supplies the required names.
+
+Current SPIDER output paths remain:
+
+```text
+<dataset-root>/processed/<dataset-name>/<robot-type>/<embodiment>/<task>/<data-id>/
+```
+
+The scene places robot qpos before later object qpos. For bimanual Wuji, controls
+and robot qpos are `[right 26][left 26]`; a future generated object remains
+after those 52 robot coordinates. Full dataset adapters and physics optimization
+configuration are future stages, not an S2 claim.

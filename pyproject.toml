@@ -59,6 +59,7 @@ warp-lang = { index = "nvidia" }
 
 [tool.hatch.build.targets.wheel]
 packages = ["spider"]
+include = ["spider/assets/**"]
 
 [project.optional-dependencies]
 dev = [
