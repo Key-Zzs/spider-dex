@@ -32,6 +32,8 @@ def _add_object_xyzrpy_actuators(
     object_pos_kd: float,
     object_rot_kp: float,
     object_rot_kd: float,
+    object_pos_forcelimit: float | None = None,
+    object_rot_forcelimit: float | None = None,
 ) -> str:
     root = ET.fromstring(xml_text)
     worldbody = root.find("worldbody")
@@ -95,6 +97,10 @@ def _add_object_xyzrpy_actuators(
                     "kp": _format_float(kp),
                     "kv": _format_float(kd),
                 }
+                force_limit = object_pos_forcelimit if group == "pos" else object_rot_forcelimit
+                if force_limit is not None:
+                    actuator_attrs["forcelimited"] = "true"
+                    actuator_attrs["forcerange"] = f"{-float(force_limit):.6g} {float(force_limit):.6g}"
                 actuator.append(ET.Element("position", actuator_attrs))
                 existing_actuators.add(actuator_name)
 
@@ -119,6 +125,12 @@ def main(
     use_visual_mesh_as_collision: bool = False,
     object_armature: float = 0.0001,
     object_frictionloss: float = 0.0001,
+    object_pos_kp: float = 0.0,
+    object_pos_kd: float = 0.0,
+    object_rot_kp: float = 0.0,
+    object_rot_kd: float = 0.0,
+    object_pos_forcelimit: float | None = None,
+    object_rot_forcelimit: float | None = None,
     friction_scale: float = 1.0,
     show_viewer: bool = True,
     act_scene: bool = False,
@@ -843,10 +855,12 @@ def main(
             xml_file,
             object_armature=object_armature,
             object_frictionloss=object_frictionloss,
-            object_pos_kp=0,
-            object_pos_kd=0,
-            object_rot_kp=0,
-            object_rot_kd=0,
+            object_pos_kp=object_pos_kp,
+            object_pos_kd=object_pos_kd,
+            object_rot_kp=object_rot_kp,
+            object_rot_kd=object_rot_kd,
+            object_pos_forcelimit=object_pos_forcelimit,
+            object_rot_forcelimit=object_rot_forcelimit,
         )
         export_file_path_act = f"{processed_dir}/../scene_act.xml"
         with open(export_file_path_act, "w") as f:

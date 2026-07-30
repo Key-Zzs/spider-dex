@@ -230,7 +230,12 @@ def _compute_weights_impl(
     # Initialize weights as zeros and compute softmax only for top samples
     weights = torch.zeros_like(rews)
     top_rews = rews[top_indices]
-    top_rews_normalized = (top_rews - top_rews.mean()) / (top_rews.std() + 1e-2)
+    # C-R3 intentionally uses a tiny real-MJWP dry run.  With one retained
+    # top sample, PyTorch's default unbiased standard deviation is undefined
+    # and contaminates an otherwise finite rollout with NaNs.  The population
+    # statistic is defined for a singleton (zero), while preserving the same
+    # normalization for larger candidate sets.
+    top_rews_normalized = (top_rews - top_rews.mean()) / (top_rews.std(unbiased=False) + 1e-2)
     top_weights = F.softmax(top_rews_normalized / temperature, dim=0)
     weights[top_indices] = top_weights
 

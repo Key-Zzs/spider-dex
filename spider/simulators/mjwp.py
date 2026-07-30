@@ -107,6 +107,32 @@ def setup_mj_model(config: Config) -> mujoco.MjModel:
     return model_cpu
 
 
+def _seed_object_mocap_references(
+    model_cpu: mujoco.MjModel, data_cpu: mujoco.MjData, qpos_init: np.ndarray
+) -> None:
+    """Seed optional Stage-C object mocaps from the same physical initial state.
+
+    The target bodies are kinematic references, not generalized-coordinate
+    writes.  Their XML pose is intentionally identity so the weld compiles
+    with an identity relative transform; this initialization prevents an
+    artificial first-step impulse when the simulated object starts at the
+    nonzero C-R2 reference pose.
+    """
+    if qpos_init.shape[0] < 64:
+        return
+    for target_name, offset in (("right_object_mocap_target", 52), ("left_object_mocap_target", 58)):
+        body_id = int(mujoco.mj_name2id(model_cpu, mujoco.mjtObj.mjOBJ_BODY, target_name))
+        if body_id < 0:
+            continue
+        mocap_id = int(model_cpu.body_mocapid[body_id])
+        if mocap_id < 0:
+            raise RuntimeError(f"{target_name} exists but is not a mocap body")
+        data_cpu.mocap_pos[mocap_id] = qpos_init[offset : offset + 3]
+        quat = np.empty(4, dtype=np.float64)
+        mujoco.mju_euler2Quat(quat, qpos_init[offset + 3 : offset + 6], "XYZ")
+        data_cpu.mocap_quat[mocap_id] = quat
+
+
 def setup_env(config: Config, ref_data: tuple[torch.Tensor, ...]) -> MJWPEnv:
     """Setup and reset the environment backed by MJWP.
     Returns an MJWPEnv with captured graph.
@@ -122,6 +148,7 @@ def setup_env(config: Config, ref_data: tuple[torch.Tensor, ...]) -> MJWPEnv:
     data_cpu.qpos[:] = arrs[0].detach().cpu().numpy()
     data_cpu.qvel[:] = arrs[1].detach().cpu().numpy()
     data_cpu.ctrl[:] = arrs[2].detach().cpu().numpy()
+    _seed_object_mocap_references(model_cpu, data_cpu, arrs[0].detach().cpu().numpy())
     mujoco.mj_step(model_cpu, data_cpu)
 
     # Move to Warp (batched worlds)

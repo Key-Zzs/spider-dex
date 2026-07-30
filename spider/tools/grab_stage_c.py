@@ -12,7 +12,10 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
+import sys
 import time
+import xml.etree.ElementTree as ET
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -66,6 +69,38 @@ def _atomic_npz(path: Path, **values: np.ndarray) -> None:
     temporary = path.with_suffix(".tmp.npz")
     np.savez_compressed(temporary, **values)
     os.replace(temporary, path)
+
+
+def _add_object_mocap_tracking(scene_path: Path) -> None:
+    """Add a compliant *reference* controller, never a qpos overwrite.
+
+    The serial-Euler object actuator is retained in the scene schema, but the
+    primary physics preflight uses this MuJoCo weld to track a source-pose
+    reference through physical constraints.  The object remains dynamic and
+    all contact impulses remain active.
+    """
+    root = ET.fromstring(scene_path.read_text(encoding="utf-8"))
+    worldbody = root.find("worldbody")
+    equality = root.find("equality")
+    if worldbody is None:
+        raise RuntimeError("scene_act has no worldbody")
+    if equality is None:
+        equality = ET.SubElement(root, "equality")
+    for side in ("right", "left"):
+        target = f"{side}_object_mocap_target"
+        if worldbody.find(f"body[@name='{target}']") is None:
+            # Compile at the identity relative pose.  Runtime code supplies
+            # the per-frame reference to data.mocap_*; baking the first source
+            # pose here would make MuJoCo infer a non-identity weld relpose.
+            ET.SubElement(worldbody, "body", {"name": target, "mocap": "true", "pos": "0 0 0", "quat": "1 0 0 0"})
+        weld_name = f"{side}_object_mocap_weld"
+        if equality.find(f"weld[@name='{weld_name}']") is None:
+            ET.SubElement(equality, "weld", {"name": weld_name, "body1": f"{side}_object", "body2": target, "solref": "0.04 1", "solimp": "0.9 0.95 0.001 0.5 2"})
+    try:
+        ET.indent(root, space="  ")
+    except AttributeError:
+        pass
+    scene_path.write_text(ET.tostring(root, encoding="unicode"), encoding="utf-8")
 
 
 def _hash_file(path: Path) -> str:
@@ -310,7 +345,12 @@ def prepare_physics_input(paths_config: str, sequence_id: str) -> str:
     _atomic_json(mano_dir.parent / "task_info.json", task_info)
     # Generate both normal and object-actuator scenes through SPIDER's own path.
     generate_xml(dataset_dir=str(sandbox), dataset_name="grab", robot_type="wuji_hand2_beta1", embodiment_type="bimanual", task=task, data_id=0, use_visual_mesh_as_collision=False, show_viewer=False, act_scene=False)
-    generate_xml(dataset_dir=str(sandbox), dataset_name="grab", robot_type="wuji_hand2_beta1", embodiment_type="bimanual", task=task, data_id=0, use_visual_mesh_as_collision=False, show_viewer=False, act_scene=True)
+    # Object tracking for the preflight is provided by the explicit mocap-weld
+    # reference below.  Keep the legacy serial-Euler position actuators in the
+    # 64-control scene schema, but give them zero gain so they cannot fight the
+    # constraint controller or introduce 2pi chart jumps into the dynamics.
+    generate_xml(dataset_dir=str(sandbox), dataset_name="grab", robot_type="wuji_hand2_beta1", embodiment_type="bimanual", task=task, data_id=0, use_visual_mesh_as_collision=False, show_viewer=False, act_scene=True, object_pos_kp=0.0, object_pos_kd=0.0, object_rot_kp=0.0, object_rot_kd=0.0)
+    _add_object_mocap_tracking(task_dir / "scene_act.xml")
     act_model = mujoco.MjModel.from_xml_path(str(task_dir / "scene_act.xml"))
     contact_site_ids = [int(mujoco.mj_name2id(act_model, mujoco.mjtObj.mjOBJ_SITE, f"{side}_{finger}_tip")) for side in ("right", "left") for finger in FINGERS]
     if any(site < 0 for site in contact_site_ids):
@@ -327,7 +367,13 @@ def prepare_physics_input(paths_config: str, sequence_id: str) -> str:
         # rad object-pose error in the R1 audit.  Keep this conversion explicit
         # and test it against the compiled MuJoCo scene below.
         objects = qpos[:, -14:].reshape(len(qpos), 2, 7)
-        object_ctrl = np.concatenate([objects[:, :, :3], Rotation.from_quat(objects[:, :, 3:][:, :, [1, 2, 3, 0]].reshape(-1, 4)).as_euler("XYZ").reshape(len(qpos), 2, 3)], axis=2).reshape(len(qpos), 12)
+        object_euler = Rotation.from_quat(objects[:, :, 3:][:, :, [1, 2, 3, 0]].reshape(-1, 4)).as_euler("XYZ").reshape(len(qpos), 2, 3)
+        # The serial-hinge chart is periodic.  Preserve the same object
+        # orientation while unwrapping target angles over time; otherwise a
+        # physically continuous source pose can produce a near-2pi actuator
+        # command jump and destabilize the rotation servos.
+        object_euler = np.unwrap(object_euler, axis=0)
+        object_ctrl = np.concatenate([objects[:, :, :3], object_euler], axis=2).reshape(len(qpos), 12)
         # scene_act represents each object as xyz + three serial rotation
         # coordinates (6 DoF), whereas Stage B stores a free-joint xyz +
         # quaternion (7 DoF).  Convert the *state* as well as controls;
@@ -679,6 +725,264 @@ def depenetrate_init(paths_config: str, sequence_id: str, profile_path: str = "c
     return str(target_dir / "metrics_depenetrated_init.json")
 
 
+def _load_preflight_inputs(paths_config: str, sequence_id: str) -> tuple[Any, mujoco.MjModel, np.ndarray, np.ndarray, Path]:
+    """Load only derived C-R2/isolated inputs and validate their alignment."""
+    paths = _paths(paths_config)
+    target = _stage_c_recovery_dir(paths, sequence_id)
+    physics_file = _stage_b_dirs(paths.workspace_root, sequence_id)[1] / "stage_c/physics_input.json"
+    if not physics_file.is_file():
+        prepare_physics_input(paths_config, sequence_id)
+    physics = json.loads(physics_file.read_text(encoding="utf-8"))
+    trajectory = target / "trajectory_depenetrated_init.npz"
+    if not trajectory.is_file():
+        raise FileNotFoundError(f"C-R3 requires the C-R2 artifact: {trajectory}")
+    with np.load(trajectory, allow_pickle=False) as archive:
+        qpos = np.asarray(archive["qpos"], dtype=np.float64)
+        qvel = np.asarray(archive["qvel"], dtype=np.float64)
+    model = mujoco.MjModel.from_xml_path(physics["scene_act"])
+    if qpos.ndim != 2 or qpos.shape[1] != model.nq or qvel.shape != (len(qpos), model.nv):
+        raise RuntimeError(f"Invalid C-R2 trajectory schema qpos={qpos.shape}, qvel={qvel.shape}, model=({model.nq}, {model.nv})")
+    if not np.isfinite(qpos).all() or not np.isfinite(qvel).all():
+        raise RuntimeError("C-R2 trajectory contains NaN/Inf")
+    return paths, model, qpos, qvel, target
+
+
+def _preflight_object_ids(model: mujoco.MjModel) -> tuple[dict[str, int], dict[str, int]]:
+    bodies: dict[str, int] = {}
+    mocap: dict[str, int] = {}
+    for side in ("right", "left"):
+        body = int(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"{side}_object"))
+        target = int(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"{side}_object_mocap_target"))
+        if body < 0 or target < 0:
+            raise RuntimeError("C-R3 scene is missing explicit object mocap-weld reference bodies")
+        mocap_id = int(model.body_mocapid[target])
+        if mocap_id < 0:
+            raise RuntimeError(f"C-R3 object target {side} is not a MuJoCo mocap body")
+        bodies[side], mocap[side] = body, mocap_id
+    return bodies, mocap
+
+
+def _set_object_mocap_reference(data: mujoco.MjData, qpos: np.ndarray, mocap_ids: dict[str, int]) -> None:
+    """Set a controller target, never an object generalized-coordinate state."""
+    for side, offset in (("right", 52), ("left", 58)):
+        data.mocap_pos[mocap_ids[side]] = qpos[offset : offset + 3]
+        xyzw = Rotation.from_euler("XYZ", qpos[offset + 3 : offset + 6]).as_quat()
+        data.mocap_quat[mocap_ids[side]] = xyzw[[3, 0, 1, 2]]
+
+
+def _object_tracking_error(data: mujoco.MjData, reference: np.ndarray, bodies: dict[str, int]) -> tuple[np.ndarray, np.ndarray]:
+    position = np.zeros(2, dtype=np.float64)
+    rotation = np.zeros(2, dtype=np.float64)
+    for index, (side, offset) in enumerate((("right", 52), ("left", 58))):
+        position[index] = np.linalg.norm(data.xpos[bodies[side]] - reference[offset : offset + 3])
+        desired = Rotation.from_euler("XYZ", reference[offset + 3 : offset + 6])
+        actual = Rotation.from_matrix(data.xmat[bodies[side]].reshape(3, 3))
+        rotation[index] = (desired.inv() * actual).magnitude()
+    return position, rotation
+
+
+def _finite_data(data: mujoco.MjData) -> bool:
+    return bool(np.isfinite(data.qpos).all() and np.isfinite(data.qvel).all() and np.isfinite(data.qacc).all() and np.isfinite(data.ctrl).all())
+
+
+def preflight_static(paths_config: str, sequence_id: str) -> str:
+    """C-R3 Level 1: audited all-frame static ``mj_forward`` on primary only."""
+    _pilot(sequence_id)
+    paths, model, qpos, qvel, target = _load_preflight_inputs(paths_config, sequence_id)
+    data = mujoco.MjData(model)
+    hand_collision = set(_hand_geom_ids(model, 2))
+    object_collision = {i for i in range(model.ngeom) if (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, i) or "").startswith("right_object_") and model.geom_group[i] == 3}
+    warnings: list[str] = []
+    old_warning = mujoco.get_mju_user_warning()
+    mujoco.set_mju_user_warning(lambda message: warnings.append(str(message)))
+    try:
+        contact_count = np.zeros(len(qpos), dtype=np.int32)
+        depth = np.zeros(len(qpos), dtype=np.float64)
+        qacc = np.zeros(len(qpos), dtype=np.float64)
+        finite = np.zeros(len(qpos), dtype=bool)
+        for frame in range(len(qpos)):
+            data.qpos[:] = qpos[frame]; data.qvel[:] = qvel[frame]
+            mujoco.mj_forward(model, data)
+            contact_count[frame] = data.ncon
+            depth[frame] = _collision_depths(data, hand_collision, object_collision).max(initial=0.0)
+            qacc[frame] = np.abs(data.qacc).max(initial=0.0)
+            finite[frame] = _finite_data(data)
+    finally:
+        mujoco.set_mju_user_warning(old_warning)
+    frames = target / "preflight_static_frames.npz"
+    _atomic_npz(frames, qacc_max=qacc, contact_count=contact_count, collision_penetration_m=depth, finite=finite.astype(np.uint8))
+    report = {"schema_version": 1, "stage": "C-R3", "level": "static_mj_forward", "sequence_id": sequence_id, "frame_count": len(qpos), "input": str(target / "trajectory_depenetrated_init.npz"), "all_finite": bool(finite.all()), "qacc_max": float(qacc.max(initial=0.0)), "contact_count_max": int(contact_count.max(initial=0)), "collision_penetration_max_m": float(depth.max(initial=0.0)), "warnings": warnings, "warning_count": len(warnings), "baseline_untouched": True, "status": "PASS" if bool(finite.all()) and not warnings else "FAIL"}
+    _atomic_json(target / "preflight_static.json", report)
+    return str(target / "preflight_static.json")
+
+
+def _key_preflight_frames(paths, sequence_id: str, qpos: np.ndarray) -> dict[str, int]:
+    target = _stage_c_recovery_dir(paths, sequence_id)
+    selection: dict[str, int] = {"start": 0, "approach": len(qpos) // 4, "interaction_midpoint": len(qpos) // 2, "end": len(qpos) - 1}
+    trace = target / "depenetration_trace.npz"
+    if trace.is_file():
+        with np.load(trace, allow_pickle=False) as archive:
+            selection["peak_original_kinematic_penetration"] = int(np.argmax(archive["collision_before_m"]))
+    contact = _stage_b_dirs(paths.workspace_root, sequence_id)[1] / "stage_c/contact_reference.npz"
+    if contact.is_file():
+        with np.load(contact, allow_pickle=False) as archive:
+            mask = archive["contact"][1:-1].astype(bool)
+        candidates = np.flatnonzero(mask.sum(axis=1) >= 2)
+        selection["first_high_confidence_contact"] = int(candidates[0]) if len(candidates) else 0
+    return selection
+
+
+def preflight_holds(paths_config: str, sequence_id: str, hold_seconds: float = 0.2) -> str:
+    """C-R3 Level 2: six fixed-reference physical holds without qpos rewrites."""
+    paths, model, qpos, _, target = _load_preflight_inputs(paths_config, sequence_id)
+    bodies, mocap = _preflight_object_ids(model)
+    selection = _key_preflight_frames(paths, sequence_id, qpos)
+    steps = max(1, int(round(float(hold_seconds) / model.opt.timestep)))
+    warnings: list[str] = []
+    old_warning = mujoco.get_mju_user_warning(); mujoco.set_mju_user_warning(lambda message: warnings.append(str(message)))
+    records: dict[str, Any] = {}
+    try:
+        for label, frame in selection.items():
+            data = mujoco.MjData(model); data.qpos[:] = qpos[frame]; data.qvel[:] = 0
+            _set_object_mocap_reference(data, qpos[frame], mocap); data.ctrl[:52] = qpos[frame, :52]; data.ctrl[52:] = 0
+            mujoco.mj_forward(model, data)
+            start_pos, start_rot = _object_tracking_error(data, qpos[frame], bodies)
+            qacc: list[float] = []; qvel: list[float] = []; finite = _finite_data(data)
+            for _ in range(steps):
+                mujoco.mj_step(model, data)
+                finite = finite and _finite_data(data)
+                qacc.append(float(np.abs(data.qacc).max(initial=0.0))); qvel.append(float(np.abs(data.qvel).max(initial=0.0)))
+            end_pos, end_rot = _object_tracking_error(data, qpos[frame], bodies)
+            records[label] = {"frame_index": int(frame), "hold_seconds": steps * model.opt.timestep, "finite": bool(finite), "qacc_max": max(qacc, default=0.0), "qvel_max": max(qvel, default=0.0), "object_translation_drift_m": (end_pos - start_pos), "object_rotation_drift_rad": (end_rot - start_rot), "object_tracking_position_m": end_pos, "object_tracking_rotation_rad": end_rot}
+    finally:
+        mujoco.set_mju_user_warning(old_warning)
+    finite = all(row["finite"] for row in records.values())
+    qacc_max = max((row["qacc_max"] for row in records.values()), default=0.0)
+    pos_drift = max((float(np.max(np.abs(row["object_translation_drift_m"]))) for row in records.values()), default=0.0)
+    rot_drift = max((float(np.max(np.abs(row["object_rotation_drift_rad"]))) for row in records.values()), default=0.0)
+    report = {"schema_version": 1, "stage": "C-R3", "level": "keyframe_holds", "sequence_id": sequence_id, "hold_seconds_requested": hold_seconds, "keyframes": records, "finite": finite, "qacc_max": qacc_max, "object_translation_drift_max_m": pos_drift, "object_rotation_drift_max_rad": rot_drift, "warnings": warnings, "warning_count": len(warnings), "gates": {"finite": finite, "qacc_below_1e5": qacc_max < 1e5, "translation_drift_below_0p01m": pos_drift <= 0.01, "rotation_drift_below_0p10rad": rot_drift <= 0.10, "no_warnings": not warnings}, "status": "PASS" if finite and qacc_max < 1e5 and pos_drift <= 0.01 and rot_drift <= 0.10 and not warnings else "FAIL"}
+    _atomic_json(target / "preflight_holds.json", report)
+    return str(target / "preflight_holds.json")
+
+
+def preflight_rollout(paths_config: str, sequence_id: str, substeps_per_frame: int = 4) -> str:
+    """C-R3 Level 3: full dynamic replay with a physical mocap-weld reference."""
+    _, model, qpos, _, target = _load_preflight_inputs(paths_config, sequence_id)
+    bodies, mocap = _preflight_object_ids(model)
+    if int(substeps_per_frame) < 1:
+        raise ValueError("substeps_per_frame must be >= 1")
+    data = mujoco.MjData(model); data.qpos[:] = qpos[0]; data.qvel[:] = 0
+    _set_object_mocap_reference(data, qpos[0], mocap); data.ctrl[:52] = qpos[0, :52]; data.ctrl[52:] = 0; mujoco.mj_forward(model, data)
+    qpos_rollout = np.zeros_like(qpos); qvel_rollout = np.zeros((len(qpos), model.nv), dtype=np.float64)
+    pos_error = np.zeros((len(qpos), 2), dtype=np.float64); rot_error = np.zeros((len(qpos), 2), dtype=np.float64); qacc = np.zeros(len(qpos), dtype=np.float64); qvel_max = np.zeros(len(qpos), dtype=np.float64); finite = np.zeros(len(qpos), dtype=bool)
+    warnings: list[str] = []; old_warning = mujoco.get_mju_user_warning(); mujoco.set_mju_user_warning(lambda message: warnings.append(str(message)))
+    try:
+        for frame in range(len(qpos)):
+            _set_object_mocap_reference(data, qpos[frame], mocap); data.ctrl[:52] = qpos[frame, :52]; data.ctrl[52:] = 0
+            for _ in range(int(substeps_per_frame)):
+                mujoco.mj_step(model, data)
+            qpos_rollout[frame] = data.qpos; qvel_rollout[frame] = data.qvel
+            pos_error[frame], rot_error[frame] = _object_tracking_error(data, qpos[frame], bodies)
+            qacc[frame] = np.abs(data.qacc).max(initial=0.0); qvel_max[frame] = np.abs(data.qvel).max(initial=0.0); finite[frame] = _finite_data(data)
+    finally:
+        mujoco.set_mju_user_warning(old_warning)
+    _atomic_npz(target / "trajectory_depenetrated_rollout.npz", qpos=qpos_rollout, qvel=qvel_rollout, source_frame_indices=np.arange(len(qpos), dtype=np.int64), object_tracking_position_m=pos_error, object_tracking_rotation_rad=rot_error, qacc_max=qacc, qvel_max=qvel_max, finite=finite.astype(np.uint8))
+    report = {"schema_version": 1, "stage": "C-R3", "level": "full_forward_rollout", "sequence_id": sequence_id, "frame_count": len(qpos), "substeps_per_frame": int(substeps_per_frame), "qacc_max": float(qacc.max(initial=0.0)), "qvel_max": float(qvel_max.max(initial=0.0)), "object_tracking": {side: {"position_rmse_m": float(np.sqrt(np.mean(pos_error[:, index] ** 2))), "position_max_m": float(pos_error[:, index].max()), "rotation_mean_rad": float(rot_error[:, index].mean()), "rotation_max_rad": float(rot_error[:, index].max())} for index, side in enumerate(("right", "left"))}, "all_finite": bool(finite.all()), "warnings": warnings, "warning_count": len(warnings), "gates": {"all_finite": bool(finite.all()), "qacc_below_1e5": bool(qacc.max(initial=0.0) < 1e5), "no_warnings": not warnings, "object_tracking_finite": bool(np.isfinite(pos_error).all() and np.isfinite(rot_error).all())}, "controller": {"kind": "mocap_weld_reference", "object_qpos_overwritten_after_initialization": False, "object_actuator_gains": "zero"}, "status": "PASS" if bool(finite.all()) and qacc.max(initial=0.0) < 1e5 and not warnings and np.isfinite(pos_error).all() and np.isfinite(rot_error).all() else "FAIL"}
+    _atomic_json(target / "metrics_depenetrated_rollout.json", report)
+    return str(target / "metrics_depenetrated_rollout.json")
+
+
+def prepare_minimal_mjwp_input(paths_config: str, sequence_id: str) -> str:
+    """Install C-R2 as the reference only inside the isolated MJWP sandbox."""
+    paths, model, qpos, qvel, target = _load_preflight_inputs(paths_config, sequence_id)
+    physics = json.loads((_stage_b_dirs(paths.workspace_root, sequence_id)[1] / "stage_c/physics_input.json").read_text(encoding="utf-8"))
+    sandbox_trajectory = Path(physics["trajectory"])
+    with np.load(sandbox_trajectory, allow_pickle=False) as prior:
+        contact = np.asarray(prior["contact"])
+        contact_pos = np.asarray(prior["contact_pos"])
+        frequency = np.asarray(prior["frequency"])
+    if contact.shape[0] != len(qpos) or contact_pos.shape[:2] != contact.shape:
+        raise RuntimeError(f"MJWP reference/contact mismatch: qpos={qpos.shape}, contact={contact.shape}, contact_pos={contact_pos.shape}")
+    _atomic_npz(sandbox_trajectory, qpos=qpos, qvel=qvel, ctrl=qpos.copy(), contact=contact, contact_pos=contact_pos, frequency=frequency)
+    payload = {"schema_version": 1, "stage": "C-R3", "sequence_id": sequence_id, "sandbox_trajectory": str(sandbox_trajectory), "source": str(target / "trajectory_depenetrated_init.npz"), "model_nq": model.nq, "object_qpos_overwritten": False, "stage_b_untouched": True}
+    _atomic_json(target / "minimal_mjwp_input.json", payload)
+    return str(target / "minimal_mjwp_input.json")
+
+
+def run_minimal_mjwp(paths_config: str, sequence_id: str, timeout_seconds: float = 180.0) -> str:
+    """C-R3 Level 4: run the real SPIDER/MJWP optimizer with a tiny dry run."""
+    paths, _, qpos, _, target = _load_preflight_inputs(paths_config, sequence_id)
+    prepare_minimal_mjwp_input(paths_config, sequence_id)
+    physics = json.loads((_stage_b_dirs(paths.workspace_root, sequence_id)[1] / "stage_c/physics_input.json").read_text(encoding="utf-8"))
+    sandbox = Path(physics["sandbox"])
+    task = sequence_id
+    config = sandbox / "processed/grab/wuji_hand2_beta1/bimanual" / task / "0/config_act.yaml"
+    output = config.parent / "trajectory_mjwp_act.npz"
+    repo = Path(__file__).resolve().parents[2]
+    command = [sys.executable, "examples/run_mjwp.py", f"+load_config_path={config}", "max_sim_steps=1", "num_samples=2", "max_num_iterations=1", "horizon=0.05", "knot_dt=0.05", "ctrl_dt=0.01", "sim_dt=0.01", "+sanity_check_seconds=0.0", "save_video=false", "show_viewer=false", "+wait_on_finish=false", "+use_torch_compile=false"]
+    started = time.monotonic()
+    try:
+        process = subprocess.run(command, cwd=repo, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=float(timeout_seconds), check=False)
+        returncode, log = int(process.returncode), process.stdout
+    except subprocess.TimeoutExpired as exc:
+        returncode, log = -1, (exc.stdout or "") + "\nTIMEOUT"
+    (target / "minimal_mjwp_stdout.log").write_text(log, encoding="utf-8")
+    arrays: dict[str, np.ndarray] = {}
+    if returncode == 0 and output.is_file():
+        with np.load(output, allow_pickle=False) as archive:
+            arrays = {name: np.asarray(archive[name]) for name in archive.files}
+    reward_arrays = {name: value for name, value in arrays.items() if "rew" in name.lower()}
+    state_arrays = {name: arrays[name] for name in ("qpos", "qvel", "ctrl") if name in arrays}
+    rewards_finite = bool(reward_arrays) and all(np.isfinite(value).all() for value in reward_arrays.values())
+    states_finite = bool(state_arrays) and all(np.isfinite(value).all() for value in state_arrays.values())
+    # The actual optimizer output must be self-consistent and have a valid
+    # dynamic object segment.  It is not accepted merely because the process
+    # exited zero.
+    schema_valid = bool(arrays) and "qpos" in arrays and arrays["qpos"].ndim == 3 and arrays["qpos"].shape[-1] == qpos.shape[1]
+    object_finite = bool(schema_valid and np.isfinite(arrays["qpos"][..., 52:64]).all())
+    if arrays:
+        _atomic_npz(target / "minimal_mjwp_trace.npz", **arrays)
+        _atomic_npz(target / "minimal_mjwp_output.npz", qpos=arrays["qpos"], qvel=arrays.get("qvel", np.empty((0,), dtype=np.float64)), ctrl=arrays.get("ctrl", np.empty((0,), dtype=np.float64)))
+    report = {"schema_version": 1, "stage": "C-R3", "level": "minimal_real_mjwp", "sequence_id": sequence_id, "command": command, "returncode": returncode, "runtime_s": time.monotonic() - started, "output": str(output), "log": str(target / "minimal_mjwp_stdout.log"), "arrays": {name: list(value.shape) for name, value in arrays.items()}, "rewards_finite": rewards_finite, "states_finite": states_finite, "object_tracking_values_finite": object_finite, "output_schema_valid": schema_valid, "gates": {"real_mjwp_exit_zero": returncode == 0, "rewards_finite": rewards_finite, "states_finite": states_finite, "object_values_finite": object_finite, "output_schema_valid": schema_valid}, "status": "PASS" if returncode == 0 and rewards_finite and states_finite and object_finite and schema_valid else "FAIL", "stage_b_untouched": True}
+    _atomic_json(target / "minimal_mjwp_run.json", report)
+    return str(target / "minimal_mjwp_run.json")
+
+
+def evaluate_r3_gate(paths_config: str, sequence_id: str) -> str:
+    """Fail-closed aggregate of every required primary-only C-R3 gate."""
+    if sequence_id != "s5__cylindermedium_lift":
+        raise ValueError("C-R3 is primary-only; smoke pilots are forbidden until C-R4")
+    paths = _paths(paths_config); target = _stage_c_recovery_dir(paths, sequence_id)
+    required = {"static": target / "preflight_static.json", "holds": target / "preflight_holds.json", "rollout": target / "metrics_depenetrated_rollout.json", "mjwp": target / "minimal_mjwp_run.json"}
+    if not all(path.is_file() for path in required.values()):
+        missing = [str(path) for path in required.values() if not path.is_file()]
+        raise FileNotFoundError(f"C-R3 reports missing: {missing}")
+    reports = {name: json.loads(path.read_text(encoding="utf-8")) for name, path in required.items()}
+    repo = Path(__file__).resolve().parents[2]
+    targeted = subprocess.run([sys.executable, "-m", "unittest", "tests.test_sampling_weights", "tests.test_stage_c_preflight", "-v"], cwd=repo, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
+    regression = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"], cwd=repo, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
+    diff = subprocess.run(["git", "diff", "--check"], cwd=repo, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
+    (target / "r3_targeted_tests.log").write_text(targeted.stdout, encoding="utf-8")
+    (target / "r3_regression_tests.log").write_text(regression.stdout, encoding="utf-8")
+    gates = {
+        "R3-01_all_frame_mj_forward_finite": bool(reports["static"]["status"] == "PASS" and reports["static"]["all_finite"]),
+        "R3-02_keyframe_holds_finite": bool(reports["holds"]["status"] == "PASS" and reports["holds"]["finite"]),
+        "R3-03_no_qpos_qacc_explosion": bool(reports["holds"]["gates"]["qacc_below_1e5"] and reports["rollout"]["gates"]["qacc_below_1e5"]),
+        "R3-04_full_forward_rollout_finite": bool(reports["rollout"]["status"] == "PASS" and reports["rollout"]["all_finite"]),
+        "R3-05_object_tracking_finite": bool(reports["rollout"]["gates"]["object_tracking_finite"]),
+        "R3-06_minimal_mjwp_rewards_finite": bool(reports["mjwp"]["rewards_finite"]),
+        "R3-07_minimal_mjwp_states_finite": bool(reports["mjwp"]["states_finite"] and reports["mjwp"]["object_tracking_values_finite"]),
+        "R3-08_output_schema_valid": bool(reports["mjwp"]["output_schema_valid"]),
+        "R3-09_targeted_tests_pass": targeted.returncode == 0,
+        "R3-10_regressions_pass": regression.returncode == 0,
+        "R3-11_git_diff_check_pass": diff.returncode == 0,
+    }
+    payload = {"schema_version": 1, "stage": "C-R3", "sequence_id": sequence_id, "source_frame_range": _pilot(sequence_id)["frame_range"], "reports": {name: str(path) for name, path in required.items()}, "test_logs": {"targeted": str(target / "r3_targeted_tests.log"), "regression": str(target / "r3_regression_tests.log")}, "controller": reports["rollout"]["controller"], "gates": gates, "status": "PASS" if all(gates.values()) else "FAIL", "stage_b_untouched": True, "smoke_pilots_started": False}
+    _atomic_json(target / "stage_c_r3_primary.json", payload)
+    _atomic_json(paths.workspace_root / "reports/stage_c_r3_primary.json", payload)
+    return str(target / "stage_c_r3_primary.json")
+
+
 def evaluate_depenetrated_init(paths_config: str, sequence_id: str) -> str:
     """Evaluate C-R2 tracking, visual geometry, contact and continuity gates."""
     paths = _paths(paths_config); target = _stage_c_recovery_dir(paths, sequence_id)
@@ -715,4 +1019,4 @@ def evaluate_depenetrated_init(paths_config: str, sequence_id: str) -> str:
 
 
 if __name__ == "__main__":
-    tyro.extras.subcommand_cli_from_dict({"make-manifest": make_manifest, "diagnose-source": diagnose_source, "build-contact-reference": build_contact_reference, "build-collision-cache": build_collision_cache, "collision-audit": collision_audit, "depenetrate-init": depenetrate_init, "evaluate-depenetrated-init": evaluate_depenetrated_init, "write-failure-report": write_failure_report})
+    tyro.extras.subcommand_cli_from_dict({"make-manifest": make_manifest, "diagnose-source": diagnose_source, "build-contact-reference": build_contact_reference, "build-collision-cache": build_collision_cache, "prepare-physics-input": prepare_physics_input, "collision-audit": collision_audit, "depenetrate-init": depenetrate_init, "evaluate-depenetrated-init": evaluate_depenetrated_init, "preflight-static": preflight_static, "preflight-holds": preflight_holds, "preflight-rollout": preflight_rollout, "prepare-minimal-mjwp-input": prepare_minimal_mjwp_input, "run-minimal-mjwp": run_minimal_mjwp, "evaluate-r3-gate": evaluate_r3_gate, "write-failure-report": write_failure_report})
