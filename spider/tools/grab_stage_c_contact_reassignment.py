@@ -22,6 +22,7 @@ from spider.contact.embodiment_assignment import (
     FINGERS, allowed_region, assignment_cost, classify_role, default_robot_regions,
     select_minimum_successful_level, viterbi_assignment,
 )
+from spider.contact.cxa_audit import is_functional_role, summarize_functional_role_recall
 from spider.datasets.paths import load_project_paths
 
 PILOTS = {
@@ -64,8 +65,14 @@ def _robot_dir(workspace: Path, sequence_id: str) -> Path:
     return workspace / "processed/grab/wuji_hand2_beta1/bimanual" / sequence_id / "0"
 
 
-def _v2_dir(workspace: Path, sequence_id: str) -> Path:
-    return _robot_dir(workspace, sequence_id) / "stage_c_contract_v2"
+def _v2_dir(workspace: Path, sequence_id: str, run_namespace: str = "stage_c_contract_v2") -> Path:
+    """Return an isolated V2 artifact namespace without path traversal."""
+    if (
+        not run_namespace.startswith("stage_c_contract_v2")
+        or not all(char.isalnum() or char in "_-" for char in run_namespace)
+    ):
+        raise ValueError("run_namespace must be a safe stage_c_contract_v2* directory name")
+    return _robot_dir(workspace, sequence_id) / run_namespace
 
 
 def freeze_v1_manifest(paths_config: str) -> str:
@@ -109,7 +116,11 @@ def freeze_v1_manifest(paths_config: str) -> str:
 
 
 def build_source_contact_roles(
-    paths_config: str, sequence_id: str, contract_path: str = "configs/project/grab_wuji_stage_c_contract_v2.yaml"
+    paths_config: str,
+    sequence_id: str,
+    contract_path: str = "configs/project/grab_wuji_stage_c_contract_v2.yaml",
+    source_contact_reference_path: str | None = None,
+    run_namespace: str = "stage_c_contract_v2",
 ) -> str:
     """Classify active source contacts before any robot-region evaluation."""
     if sequence_id not in PILOTS:
@@ -119,7 +130,7 @@ def build_source_contact_roles(
     contract = yaml.safe_load(contract_file.read_text(encoding="utf-8"))
     if contract.get("contract_name") != "TASK_EQUIVALENT_CONTACT" or contract.get("contract_version") != 2:
         raise RuntimeError("invalid Contract V2")
-    source = _robot_dir(paths.workspace_root, sequence_id) / "stage_c/contact_reference.json"
+    source = Path(source_contact_reference_path) if source_contact_reference_path else _robot_dir(paths.workspace_root, sequence_id) / "stage_c/contact_reference.json"
     if not source.is_file():
         raise FileNotFoundError(source)
     payload = json.loads(source.read_text(encoding="utf-8"))
@@ -169,10 +180,11 @@ def build_source_contact_roles(
                                   "mean_distance_m": float(np.mean([np.linalg.norm(point - points.mean(axis=0)) for point in simultaneous_other])) if simultaneous_other else None},
             "source_frame_indices": [int(row["frame_index"]) for row in rows], "stage_c_frame_indices": frames,
         })
-    result = {"schema_version": 1, "stage": "C-X1", "sequence_id": sequence_id, "contract_name": contract["contract_name"],
+    result = {"schema_version": 2, "stage": "C-X1", "sequence_id": sequence_id, "contract_name": contract["contract_name"],
               "contract_hash": _hash(contract_file), "source_only": True, "roles": roles,
+              "source_contact_reference": str(source),
               "inactive_contact_policy": "NON_INTERACTING; no assignment candidates are created for inactive source contacts"}
-    output = _v2_dir(paths.workspace_root, sequence_id) / "source_contact_roles.json"
+    output = _v2_dir(paths.workspace_root, sequence_id, run_namespace) / "source_contact_roles.json"
     _write_json(output, result)
     np.savez_compressed(output.with_suffix(".npz"), role_frame_starts=np.asarray([row["frame_start"] for row in roles], dtype=np.int32), role_frame_ends=np.asarray([row["frame_end"] for row in roles], dtype=np.int32), role_confidence=np.asarray([row["confidence"] for row in roles], dtype=np.float64))
     return str(output)
@@ -214,19 +226,24 @@ def _patch_faces(mesh: trimesh.Trimesh, center: np.ndarray, normal: np.ndarray, 
 
 
 def build_surface_patches(
-    paths_config: str, sequence_id: str, contract_path: str = "configs/project/grab_wuji_stage_c_contract_v2.yaml"
+    paths_config: str,
+    sequence_id: str,
+    contract_path: str = "configs/project/grab_wuji_stage_c_contract_v2.yaml",
+    source_contact_reference_path: str | None = None,
+    run_namespace: str = "stage_c_contract_v2",
 ) -> str:
     """Build object-local, normal-aware mesh-adjacent patches from source only."""
     if sequence_id not in PILOTS:
         raise ValueError("V2 patches are restricted to frozen pilots")
     paths = _paths(paths_config); workspace = paths.workspace_root
     contract = yaml.safe_load(Path(contract_path).read_text(encoding="utf-8"))
-    root = _v2_dir(workspace, sequence_id)
+    root = _v2_dir(workspace, sequence_id, run_namespace)
     role_path = root / "source_contact_roles.json"
     if not role_path.is_file():
-        build_source_contact_roles(paths_config, sequence_id, contract_path)
-    roles = json.loads(role_path.read_text(encoding="utf-8"))["roles"]
-    contact_path = _robot_dir(workspace, sequence_id) / "stage_c/contact_reference.json"
+        build_source_contact_roles(paths_config, sequence_id, contract_path, source_contact_reference_path, run_namespace)
+    role_payload = json.loads(role_path.read_text(encoding="utf-8"))
+    roles = role_payload["roles"]
+    contact_path = Path(source_contact_reference_path) if source_contact_reference_path else Path(role_payload.get("source_contact_reference") or _robot_dir(workspace, sequence_id) / "stage_c/contact_reference.json")
     trajectory_path = _robot_dir(workspace, sequence_id) / "trajectory_kinematic.npz"
     physics_path = _robot_dir(workspace, sequence_id) / "stage_c/physics_input.json"
     contact = json.loads(contact_path.read_text(encoding="utf-8"))
@@ -272,20 +289,25 @@ def build_surface_patches(
 
 
 def build_assignment_candidates(
-    paths_config: str, sequence_id: str, level: int, contract_path: str = "configs/project/grab_wuji_stage_c_contract_v2.yaml"
+    paths_config: str,
+    sequence_id: str,
+    level: int,
+    contract_path: str = "configs/project/grab_wuji_stage_c_contract_v2.yaml",
+    run_namespace: str = "stage_c_contract_v2",
 ) -> str:
     """Build bounded same-side candidate sets and select interval-stable assignments."""
     if sequence_id not in PILOTS or level not in range(1, 5):
         raise ValueError("V2 candidate generation requires frozen pilot and level 1..4")
     paths = _paths(paths_config); workspace = paths.workspace_root
     contract_file = Path(contract_path); contract = yaml.safe_load(contract_file.read_text(encoding="utf-8"))
-    role_path = _v2_dir(workspace, sequence_id) / "source_contact_roles.json"
+    root = _v2_dir(workspace, sequence_id, run_namespace)
+    role_path = root / "source_contact_roles.json"
     if not role_path.is_file():
-        build_source_contact_roles(paths_config, sequence_id, contract_path)
+        build_source_contact_roles(paths_config, sequence_id, contract_path, run_namespace=run_namespace)
     roles = json.loads(role_path.read_text(encoding="utf-8"))["roles"]
-    patch_path = _v2_dir(workspace, sequence_id) / "source_contact_patches.json"
+    patch_path = root / "source_contact_patches.json"
     if not patch_path.is_file():
-        build_surface_patches(paths_config, sequence_id, contract_path)
+        build_surface_patches(paths_config, sequence_id, contract_path, run_namespace=run_namespace)
     # Reachability is a bounded source-to-current-Wuji diagnostic.  It is not
     # a retroactive role classifier and cannot approve a collision path; its
     # only job is to rank the finite candidate catalogue before physical gates.
@@ -356,7 +378,6 @@ def build_assignment_candidates(
                          "assignment_duration_frames": role["frame_count"], "source_patch_id": f"patch:{role['role_id']}"})
         trace.append({"role_id": role["role_id"], "path": path.tolist(), "switch_count": switches, "max_switches": max_switches, "status": "SELECTED"})
     status = "PASS_CANDIDATE_GENERATION" if len(selected) == len(roles) else "FAIL_CANDIDATE_GENERATION"
-    root = _v2_dir(workspace, sequence_id)
     candidate_path = root / f"contact_assignment_candidates_level_{level}.json"
     _write_json(candidate_path, {"schema_version": 1, "stage": "C-X3", "sequence_id": sequence_id, "level": level, "status": status, "candidates": candidates})
     candidate_offsets = [0]; candidate_costs: list[float] = []
@@ -375,7 +396,13 @@ def build_assignment_candidates(
     return str(selected_path)
 
 
-def compile_contact_targets(paths_config: str, sequence_id: str, level: int, flexible_patch: bool = False) -> str:
+def compile_contact_targets(
+    paths_config: str,
+    sequence_id: str,
+    level: int,
+    flexible_patch: bool = False,
+    run_namespace: str = "stage_c_contract_v2",
+) -> str:
     """Compile a selected assignment to isolated (T,10,3) V2 targets.
 
     The source reference stays intact.  This file adds an explicit robot
@@ -383,22 +410,24 @@ def compile_contact_targets(paths_config: str, sequence_id: str, level: int, fle
     """
     if sequence_id not in PILOTS or level not in range(1, 5):
         raise ValueError("V2 target compilation requires frozen pilot and level 1..4")
-    paths = _paths(paths_config); root = _v2_dir(paths.workspace_root, sequence_id)
+    paths = _paths(paths_config); root = _v2_dir(paths.workspace_root, sequence_id, run_namespace)
     contract = yaml.safe_load(Path("configs/project/grab_wuji_stage_c_contract_v2.yaml").read_text(encoding="utf-8"))
     selected_path = root / f"selected_contact_assignment_level_{level}.json"
     role_path = root / "source_contact_roles.json"
     if not selected_path.is_file():
-        build_assignment_candidates(paths_config, sequence_id, level)
+        build_assignment_candidates(paths_config, sequence_id, level, run_namespace=run_namespace)
     selected = json.loads(selected_path.read_text(encoding="utf-8"))["selected"]
-    roles = {row["role_id"]: row for row in json.loads(role_path.read_text(encoding="utf-8"))["roles"]}
+    role_payload = json.loads(role_path.read_text(encoding="utf-8"))
+    roles = {row["role_id"]: row for row in role_payload["roles"]}
     patches = {row["patch_id"]: row for row in json.loads((root / "source_contact_patches.json").read_text(encoding="utf-8"))["patches"]}
-    source_npz = _robot_dir(paths.workspace_root, sequence_id) / "stage_c/contact_reference.npz"
+    source_json = Path(role_payload.get("source_contact_reference") or _robot_dir(paths.workspace_root, sequence_id) / "stage_c/contact_reference.json")
+    source_npz = source_json.with_suffix(".npz")
     with np.load(source_npz, allow_pickle=False) as archive:
         source_expected = np.asarray(archive["contact"][1:-1], dtype=bool)
         source_anchors = np.asarray(archive["contact_surface_world"][1:-1], dtype=np.float64)
     source_normals = np.zeros_like(source_anchors)
-    source_json = json.loads((_robot_dir(paths.workspace_root, sequence_id) / "stage_c/contact_reference.json").read_text(encoding="utf-8"))
-    for row in source_json["records"]:
+    source_payload = json.loads(source_json.read_text(encoding="utf-8"))
+    for row in source_payload["records"]:
         source_frame = int(row["frame_index"])
         if row.get("contact_flag") and 0 < source_frame < len(source_expected) + 1:
             source_normals[source_frame - 1, int(row["contact_channel"])] = row["surface_normal_world"]
@@ -452,7 +481,7 @@ def compile_contact_targets(paths_config: str, sequence_id: str, level: int, fle
         row["robot_contact_channel"] = robot_channel; row["source_contact_channel"] = source_channel
     suffix = "_flexible" if flexible_patch else ""
     output = root / f"contact_targets_level_{level}{suffix}.npz"
-    _write_json(root / f"contact_targets_level_{level}{suffix}.json", {"schema_version": 1, "sequence_id": sequence_id, "level": level, "flexible_patch": flexible_patch, "selected_assignment": str(selected_path), "output": str(output), "source_contact_reference": str(source_npz), "object_pose_immutable": True})
+    _write_json(root / f"contact_targets_level_{level}{suffix}.json", {"schema_version": 2, "sequence_id": sequence_id, "level": level, "flexible_patch": flexible_patch, "selected_assignment": str(selected_path), "output": str(output), "source_contact_reference": str(source_npz), "source_contact_reference_json": str(source_json), "object_pose_immutable": True})
     np.savez_compressed(output, expected=expected.astype(np.uint8), anchors=anchors, normals=normals, assignment_index=assignment_index, source_expected=source_expected.astype(np.uint8), source_anchors=source_anchors, source_normals=source_normals)
     return str(output)
 
@@ -460,28 +489,34 @@ def compile_contact_targets(paths_config: str, sequence_id: str, level: int, fle
 def evaluate_v2_depenetrated(
     paths_config: str, sequence_id: str, level: int, trajectory_path: str, metrics_path: str,
     contact_targets_path: str | None = None,
+    run_namespace: str = "stage_c_contract_v2",
+    refresh_base_metrics: bool = True,
 ) -> str:
-    """Evaluate V1 and V2 metrics side-by-side without changing either contract."""
+    """Evaluate V2 against mesh patches, not arbitrary single-point anchors."""
     if sequence_id not in PILOTS or level not in range(1, 5):
         raise ValueError("V2 evaluation requires frozen pilot and level 1..4")
     # Reuse the audited V1 geometry/tracking evaluator only to retain its
     # exact metric.  V2 fields are appended under a distinct namespace.
     from spider.tools.grab_stage_c import _site_ids, _stage_b_dirs, evaluate_depenetrated_init
 
-    paths = _paths(paths_config); root = _v2_dir(paths.workspace_root, sequence_id)
+    paths = _paths(paths_config); root = _v2_dir(paths.workspace_root, sequence_id, run_namespace)
     targets_path = Path(contact_targets_path) if contact_targets_path is not None else root / f"contact_targets_level_{level}.npz"
     selected_path = root / f"selected_contact_assignment_level_{level}.json"
     if not targets_path.is_file() or not selected_path.is_file():
         raise FileNotFoundError("compile V2 contact targets before evaluation")
-    evaluate_depenetrated_init(paths_config, sequence_id, trajectory_path=trajectory_path, metrics_path=metrics_path)
+    if refresh_base_metrics:
+        evaluate_depenetrated_init(paths_config, sequence_id, trajectory_path=trajectory_path, metrics_path=metrics_path)
+    elif not Path(metrics_path).is_file():
+        raise FileNotFoundError("report-only V2 metric evaluation requires an existing base metrics document")
     metrics_file = Path(metrics_path); metrics = json.loads(metrics_file.read_text(encoding="utf-8"))
     contract = yaml.safe_load(Path("configs/project/grab_wuji_stage_c_contract_v2.yaml").read_text(encoding="utf-8"))
-    physics = json.loads((_stage_b_dirs(paths.workspace_root, sequence_id)[1] / "stage_c/physics_input.json").read_text(encoding="utf-8"))
+    robot_dir = _stage_b_dirs(paths.workspace_root, sequence_id)[1]
+    physics = json.loads((robot_dir / "stage_c/physics_input.json").read_text(encoding="utf-8"))
     with np.load(trajectory_path, allow_pickle=False) as archive:
         qpos = np.asarray(archive["qpos"], dtype=np.float64)
     with np.load(targets_path, allow_pickle=False) as archive:
-        expected = np.asarray(archive["expected"], dtype=bool); anchors = np.asarray(archive["anchors"], dtype=np.float64)
-        normals = np.asarray(archive["normals"], dtype=np.float64); assignment_index = np.asarray(archive["assignment_index"], dtype=np.int32)
+        expected = np.asarray(archive["expected"], dtype=bool)
+        assignment_index = np.asarray(archive["assignment_index"], dtype=np.int32)
     if qpos.shape[0] != expected.shape[0] or expected.shape != assignment_index.shape:
         raise RuntimeError("V2 trajectory/target schema mismatch")
     model = mujoco.MjModel.from_xml_path(physics["scene_act"]); data = mujoco.MjData(model); site_ids = _site_ids(model)
@@ -489,27 +524,101 @@ def evaluate_v2_depenetrated(
     for frame, state in enumerate(qpos):
         data.qpos[:] = state; data.qvel[:] = 0; mujoco.mj_forward(model, data)
         tips[frame] = data.site_xpos[site_ids][[1, 2, 3, 4, 5, 7, 8, 9, 10, 11]]
-    distance = np.linalg.norm(tips - anchors, axis=2)
-    threshold = float(contract["acceptance"]["patch_distance_m"])
-    covered = expected & (distance <= threshold)
-    vector = tips - anchors; length = np.linalg.norm(vector, axis=2); normal_length = np.linalg.norm(normals, axis=2)
-    valid_normal = expected & (length > 1e-9) & (normal_length > 1e-9)
+    role_payload = json.loads((root / "source_contact_roles.json").read_text(encoding="utf-8"))
+    roles = {row["role_id"]: row for row in role_payload["roles"]}
+    patches = {row["patch_id"]: row for row in json.loads((root / "source_contact_patches.json").read_text(encoding="utf-8"))["patches"]}
+    with np.load(robot_dir / "trajectory_kinematic.npz", allow_pickle=False) as archive:
+        source_qpos = np.asarray(archive["qpos"], dtype=np.float64)
+    if source_qpos.shape[0] != qpos.shape[0] or source_qpos.shape[1] < 14:
+        raise RuntimeError("immutable source object trajectory is incompatible with V2 trajectory")
+    mesh = trimesh.load(Path(physics["collision_cache"]) / "visual/visual.obj", force="mesh")
+    if not isinstance(mesh, trimesh.Trimesh) or len(mesh.faces) == 0:
+        raise RuntimeError("V2 patch metric requires a non-empty object visual mesh")
+
+    # The robot trajectory is in the MuJoCo serial-hinge chart while the
+    # immutable contact patches are object-local to the Stage-B source free
+    # joint.  Use the latter only for the world-to-patch transform; it does
+    # not alter object qpos, tracking, or any acceptance threshold.
+    distance = np.full(expected.shape, np.nan, dtype=np.float64)
     cosine = np.full(expected.shape, np.nan, dtype=np.float64)
-    cosine[valid_normal] = np.sum(vector[valid_normal] * normals[valid_normal], axis=1) / (length[valid_normal] * normal_length[valid_normal])
+    threshold = float(contract["acceptance"]["patch_distance_m"])
     selected = json.loads(selected_path.read_text(encoding="utf-8"))["selected"]
-    role_pass: list[bool] = []
-    for index, _row in enumerate(selected):
-        mask = assignment_index == index
-        role_pass.append(bool(mask.any() and np.mean(covered[mask]) >= 0.8))
+    role_metrics: list[dict[str, Any]] = []
+    patch_failures: list[dict[str, Any]] = []
+    for index, row in enumerate(selected):
+        role = roles[row["role_id"]]
+        patch = patches[row["source_patch_id"]]
+        side, finger, kind = str(row["selected_robot_region"]).split("_")
+        if kind != "fingertip":
+            raise RuntimeError("fail closed: V2 patch evaluation requires a fingertip assignment")
+        channel = (0 if side == "right" else 5) + FINGERS.index(finger)
+        frames = np.asarray(role["stage_c_frame_indices"], dtype=np.int64)
+        if not np.all(assignment_index[frames, channel] == index):
+            raise RuntimeError("V2 assignment index does not match selected role frames")
+        if level == 4:
+            _seed, face_ids = _patch_faces(
+                mesh,
+                np.asarray(patch["center_object_local"], dtype=np.float64),
+                np.asarray(patch["surface_normal_object_local"], dtype=np.float64),
+                float(contract["patches"]["functional_surface_radius_m"]),
+            )
+        else:
+            face_ids = patch["extended_face_ids"]
+        if not face_ids:
+            raise RuntimeError("fail closed: V2 patch has no accepted mesh faces")
+        patch_mesh = trimesh.Trimesh(
+            vertices=np.asarray(mesh.vertices), faces=np.asarray(mesh.faces)[np.asarray(face_ids, dtype=np.int64)], process=False
+        )
+        rotations: list[Rotation] = []
+        local_tips: list[np.ndarray] = []
+        for frame in frames:
+            object_pose = source_qpos[frame, -14:-7]
+            rotation = Rotation.from_quat(object_pose[3:7][[1, 2, 3, 0]])
+            rotations.append(rotation)
+            local_tips.append(rotation.inv().apply(tips[frame, channel] - object_pose[:3]))
+        closest_local, role_distance, face_index = trimesh.proximity.closest_point_naive(patch_mesh, np.asarray(local_tips))
+        role_distance = np.asarray(role_distance, dtype=np.float64)
+        role_cosine = np.full(len(frames), np.nan, dtype=np.float64)
+        for local_index, frame in enumerate(frames):
+            point_world = rotations[local_index].apply(closest_local[local_index]) + source_qpos[frame, -14:-11]
+            normal_world = rotations[local_index].apply(
+                np.array(patch_mesh.face_normals[int(face_index[local_index])], dtype=np.float64, copy=True)
+            )
+            vector = tips[frame, channel] - point_world
+            length = float(np.linalg.norm(vector)); normal_length = float(np.linalg.norm(normal_world))
+            if length > 1e-9 and normal_length > 1e-9:
+                role_cosine[local_index] = float(np.dot(vector, normal_world) / (length * normal_length))
+            distance[frame, channel] = role_distance[local_index]
+            cosine[frame, channel] = role_cosine[local_index]
+            if role_distance[local_index] > threshold:
+                patch_failures.append({
+                    "frame": int(frame), "side": role["side"], "source_role": role["role_id"],
+                    "source_finger": role["source_finger"], "patch_id": patch["patch_id"],
+                    "selected_robot_region": row["selected_robot_region"], "distance_m": float(role_distance[local_index]),
+                    "normal_cosine": None if not np.isfinite(role_cosine[local_index]) else float(role_cosine[local_index]),
+                    "confidence": float(role["confidence"]),
+                })
+        covered_role = role_distance <= threshold
+        role_metrics.append({
+            "role_id": role["role_id"], "role_type": role["functional_role"], "side": role["side"],
+            "source_finger": role["source_finger"], "selected_robot_region": row["selected_robot_region"],
+            "sample_count": int(len(frames)), "coverage": float(np.mean(covered_role)),
+            "distance_p95_m": float(np.percentile(role_distance, 95)),
+            "normal_cosine_median": float(np.nanmedian(role_cosine)) if np.isfinite(role_cosine).any() else None,
+            "passed": bool(np.mean(covered_role) >= 0.8),
+            "functional_eligible": is_functional_role(str(role["functional_role"])),
+        })
+    covered = expected & (distance <= threshold)
+    role_recall = summarize_functional_role_recall(role_metrics)
     coverage = float(np.count_nonzero(covered) / max(1, np.count_nonzero(expected)))
     patch_distance_p95 = float(np.percentile(distance[expected], 95)) if np.any(expected) else float("nan")
-    finite_cosine = cosine[valid_normal]
+    finite_cosine = cosine[expected & np.isfinite(cosine)]
     normal_median = float(np.median(finite_cosine)) if len(finite_cosine) else float("nan")
     gates = {
         "v1_exact_metric_preserved": "contact" in metrics and "high_confidence_recall" in metrics["contact"],
         "task_equivalent_patch_coverage": coverage >= float(contract["acceptance"]["task_equivalent_patch_coverage"]),
         "surface_patch_distance_p95": bool(np.isfinite(patch_distance_p95) and patch_distance_p95 <= float(contract["acceptance"]["patch_distance_p95_m"])),
-        "functional_role_recall": float(np.mean(role_pass)) >= float(contract["acceptance"]["functional_role_recall"]),
+        "functional_role_recall": role_recall["value"] >= float(contract["acceptance"]["functional_role_recall"]),
         "normal_alignment": bool(np.isfinite(normal_median) and normal_median >= float(contract["acceptance"]["normal_cosine_median"])),
         "depenetrated_visual_penetration": metrics["visual_penetration"]["max_penetration_m"] <= float(contract["acceptance"]["depenetrated_visual_max_m"]),
         "depenetrated_collision_penetration": metrics["collision"]["after_max_m"] <= float(contract["acceptance"]["depenetrated_collision_max_m"]),
@@ -517,10 +626,14 @@ def evaluate_v2_depenetrated(
     }
     metrics["exact_contact_recall_v1"] = metrics["contact"]["high_confidence_recall"]
     metrics["task_equivalent_contact_v2"] = {
-        "patch_coverage": coverage, "functional_role_recall": float(np.mean(role_pass)) if role_pass else 0.0,
+        "patch_coverage": coverage, "functional_role_recall": role_recall["value"],
         "surface_patch_distance_p95_m": patch_distance_p95,
         "normal_cosine_median": normal_median, "assignment_switch_rate_per_s": 0.0,
         "assignment_count": len(selected), "identity_change_count": sum(row["source_finger"] not in row["selected_robot_region"] for row in selected),
+        "patch_distance_definition": "frame-weighted Euclidean nearest distance from each selected robot fingertip to its assigned mesh-adjacent object patch",
+        "functional_role_recall_audit": role_recall,
+        "role_metrics": role_metrics,
+        "patch_distance_failures": patch_failures,
     }
     metrics["contract_v2"] = {"name": "TASK_EQUIVALENT_CONTACT", "level": level, "targets": str(targets_path), "gates": gates,
                               "status": "PASS" if all(gates.values()) else "FAIL"}
@@ -528,11 +641,17 @@ def evaluate_v2_depenetrated(
     return str(metrics_file)
 
 
-def write_level_result(paths_config: str, sequence_id: str, level: int, metrics_path: str) -> str:
+def write_level_result(
+    paths_config: str,
+    sequence_id: str,
+    level: int,
+    metrics_path: str,
+    run_namespace: str = "stage_c_contract_v2",
+) -> str:
     """Write a fail-closed level outcome; static failure forbids costly replay."""
     if sequence_id not in PILOTS or level not in range(1, 5):
         raise ValueError("V2 level result requires frozen pilot and level 1..4")
-    paths = _paths(paths_config); root = _v2_dir(paths.workspace_root, sequence_id)
+    paths = _paths(paths_config); root = _v2_dir(paths.workspace_root, sequence_id, run_namespace)
     metrics = json.loads(Path(metrics_path).read_text(encoding="utf-8"))
     v2 = metrics.get("contract_v2", {})
     if v2.get("level") != level or v2.get("name") != "TASK_EQUIVALENT_CONTACT":

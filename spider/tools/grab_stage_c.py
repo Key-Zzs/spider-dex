@@ -381,7 +381,25 @@ def diagnose_source(paths_config: str, sequence_id: str) -> str:
     return str(output / "source_geometry_diagnostics.json")
 
 
-def build_contact_reference(paths_config: str, sequence_id: str, distance_threshold_m: float = 0.015) -> str:
+def build_contact_reference(
+    paths_config: str,
+    sequence_id: str,
+    distance_threshold_m: float = 0.015,
+    output_tag: str = "",
+) -> str:
+    """Build source contacts from surface proximity, preserving rejected evidence.
+
+    A watertight signed-distance query makes the *sign* reliable, but it does
+    not make a deeply penetrating fingertip a reliable surface contact.  The
+    original inclusive flag is retained in each record for audit; the emitted
+    contact tensor contains only samples within ``distance_threshold_m``.
+    ``output_tag`` writes an isolated reference so frozen V1 artifacts are
+    never overwritten during a V2/C-XA correction.
+    """
+    if output_tag and not all(char.isalnum() or char in "_-" for char in output_tag):
+        raise ValueError("output_tag may contain only letters, digits, '_' and '-'")
+    if distance_threshold_m <= 0:
+        raise ValueError("distance_threshold_m must be positive")
     paths = _paths(paths_config)
     frozen = _pilot(sequence_id)
     adapter = GrabAdapter(paths)
@@ -405,18 +423,26 @@ def build_contact_reference(paths_config: str, sequence_id: str, distance_thresh
                 channel = side_index * 5 + finger_index; source = source_points[frame, finger_index]; surface = surface_points[finger_index]
                 nearest_vertex = int(np.argmin(np.einsum("ij,ij->i", mesh.vertices - closest[frame, finger_index], mesh.vertices - closest[frame, finger_index])))
                 normal = rotation.apply(np.array(mesh.vertex_normals[nearest_vertex], dtype=np.float64, copy=True))
-                flag = bool(unsigned[frame, finger_index] <= distance_threshold_m or (np.isfinite(signed[frame, finger_index]) and signed[frame, finger_index] < 0))
+                raw_inclusive_flag = bool(
+                    unsigned[frame, finger_index] <= distance_threshold_m
+                    or (np.isfinite(signed[frame, finger_index]) and signed[frame, finger_index] < 0)
+                )
+                reliable_source = bool(unsigned[frame, finger_index] <= distance_threshold_m)
+                flag = reliable_source
                 contact[frame, channel] = flag; positions[frame, channel] = surface
-                records.append({"frame_index": frame, "source_frame": int(sequence.source_metadata["source_frame_indices"][frame]), "side": side, "finger_region": finger, "source_point_world": source, "surface_point_world": surface, "surface_normal_world": normal, "source_signed_distance_m": signed[frame, finger_index], "unsigned_distance_m": unsigned[frame, finger_index], "projected_distance_m": float(np.linalg.norm(source - surface)), "confidence": confidence, "sign_method": method, "contact_flag": flag, "contact_channel": channel})
+                records.append({"frame_index": frame, "source_frame": int(sequence.source_metadata["source_frame_indices"][frame]), "side": side, "finger_region": finger, "source_point_world": source, "surface_point_world": surface, "surface_normal_world": normal, "source_signed_distance_m": signed[frame, finger_index], "unsigned_distance_m": unsigned[frame, finger_index], "projected_distance_m": float(np.linalg.norm(source - surface)), "confidence": confidence, "sign_method": method, "contact_flag": flag, "raw_inclusive_contact_flag": raw_inclusive_flag, "source_reliability": "RELIABLE_SOURCE" if reliable_source else ("UNRELIABLE_SOURCE" if raw_inclusive_flag else "NON_CONTACT"), "contact_channel": channel})
     for channel in range(10):
         interval_id = np.full(sequence.num_frames, -1, dtype=np.int32)
         for value, (start, end) in enumerate(_intervals(contact[:, channel])): interval_id[start:end] = value
         for row in records:
             if row["contact_channel"] == channel: row["contact_interval_id"] = int(interval_id[row["frame_index"]])
     _, robot = _stage_b_dirs(paths.workspace_root, sequence_id); output = robot / "stage_c"
-    _atomic_npz(output / "contact_reference.npz", source_frame_indices=np.asarray(sequence.source_metadata["source_frame_indices"], dtype=np.int64), contact=contact, contact_surface_world=positions)
-    _atomic_json(output / "contact_reference.json", {"schema_version": 1, "sequence_id": sequence_id, "source_only": True, "distance_threshold_m": distance_threshold_m, "records": records, "intervals": {str(index): _intervals(contact[:, index]) for index in range(10)}})
-    return str(output / "contact_reference.json")
+    suffix = f"_{output_tag}" if output_tag else ""
+    npz_path = output / f"contact_reference{suffix}.npz"
+    json_path = output / f"contact_reference{suffix}.json"
+    _atomic_npz(npz_path, source_frame_indices=np.asarray(sequence.source_metadata["source_frame_indices"], dtype=np.int64), contact=contact, contact_surface_world=positions)
+    _atomic_json(json_path, {"schema_version": 2, "sequence_id": sequence_id, "source_only": True, "distance_threshold_m": distance_threshold_m, "contact_policy": "closest-surface distance within tolerance; deeply penetrating source samples remain recorded as UNRELIABLE_SOURCE but are not active contacts", "records": records, "intervals": {str(index): _intervals(contact[:, index]) for index in range(10)}})
+    return str(json_path)
 
 
 def build_collision_cache(paths_config: str, sequence_id: str, max_convex_hulls: int = 8) -> str:
