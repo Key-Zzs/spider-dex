@@ -38,6 +38,17 @@ and stability gates before any physical preflight or screenshots are allowed.
 The current bounded V2 ladder is blocked; see the external contract comparison
 and [V2 handoff](HANDOFF_STAGE_C_CONTRACT_V2.md).
 
+## Stage C-V2 dynamic validation
+
+C-XA later established a corrected V2 Level-1 static pass without changing
+V1 or historical V2 evidence. Its first dynamic acceptance run is **FAIL at
+D2 full forward rollout**: D0 input freeze and D1 holds passed, but object
+tracking, repeated real contact penetration, and robot tracking did not. MJWP,
+smokes, dynamic HTML, and screenshots are therefore **NOT_RUN**. See the
+[dynamic acceptance](STAGE_C_V2_DYNAMIC_ACCEPTANCE.md) and
+[handoff](HANDOFF_STAGE_C_V2_DYNAMIC.md); do not use Stage-B or old-V2 HTML as
+substitutes.
+
 ## Automated validation
 
 Run from the repository root:

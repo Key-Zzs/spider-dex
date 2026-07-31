@@ -1,0 +1,51 @@
+# Frozen dynamic-acceptance settings for corrected Contract V2 Level 1.
+# Numeric alarm limits are derived from the immutable corrected trajectory at
+# D0 and recorded verbatim in each input-freeze report.  They are deliberately
+# not tuned after a failing primary hold.
+profile_name: grab_wuji_stage_c_v2_dynamic
+contract_path: configs/project/grab_wuji_stage_c_contract_v2.yaml
+corrected_namespace: stage_c_contract_v2_cxa
+corrected_level: 1
+seed: 20260731
+
+physics:
+  # These values identify the already audited Stage-C scene.  The object is
+  # driven only through its mocap-weld reference; generalized object qpos is
+  # never written after initialization.
+  object_controller: mocap_weld_reference
+  substeps_per_source_frame: 4
+  hold_seconds: 0.20
+  source_fps: 120.0
+
+preflight_thresholds:
+  qacc_reference_quantile: 0.99
+  qacc_reference_multiplier: 10.0
+  qacc_floor: 100000.0
+  qvel_reference_quantile: 0.99
+  qvel_reference_multiplier: 10.0
+  qvel_floor: 1.0
+  actuator_force_reference_quantile: 0.99
+  actuator_force_reference_multiplier: 10.0
+  actuator_force_floor: 10.0
+  object_translation_drift_m: 0.010
+  object_rotation_drift_rad: 0.10
+  consecutive_growth_factor: 10.0
+  consecutive_growth_count: 3
+
+acceptance:
+  wrist_rmse_m: 0.03
+  fingertip_rmse_m: 0.08
+  task_equivalent_patch_coverage: 0.70
+  functional_role_recall: 0.80
+  patch_distance_p95_m: 0.020
+  normal_cosine_median: 0.50
+  visual_max_penetration_m: 0.010
+  visual_p95_penetration_m: 0.005
+  visual_mean_negative_depth_m: 0.002
+  visual_penetrating_vertex_ratio: 0.05
+  frame_visual_max_penetration_m: 0.020
+  object_pos_rmse_m: 0.03
+  object_pos_max_m: 0.08
+  object_rot_mean_rad: 0.20
+  object_rot_max_rad: 0.50
+  max_normalized_joint_delta: 0.25

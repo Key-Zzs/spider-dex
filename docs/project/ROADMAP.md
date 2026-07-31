@@ -9,7 +9,7 @@
 | S3A | External data infrastructure | External workspace and local-only paths | Registry, canonical HOI schema, manifests, audit CLI | No | Complete |
 | S4 | Single-sequence GRAB retargeting | One external GRAB sequence | Bounded trajectory and diagnostics | Required | Automated pipeline complete; manual review pending |
 | S5 | Physics/contact/collision tuning and evaluation | S4 trajectory | Reproducible evaluation record | Required | Not started |
-| Stage C-X | Embodiment-aware task-equivalent contact | Frozen Stage B pilots and immutable V1 evidence | Versioned V2 assignment and fail-closed comparison | Only for V2 PASS candidates | Blocked: no bounded relaxation level passed |
+| Stage C-X | Embodiment-aware task-equivalent contact | Frozen Stage B pilots and immutable V1 evidence | C-XA corrected V2 Level-1 static pass; dynamic D0/D1 pass, D2 fail-closed | No dynamic review material after D2 failure | Dynamic primary blocked; MJWP/smokes/Stage D not started |
 | S6 | Batch GRAB conversion | Frozen batch selection | External processed outputs and report | Sampling review | Not started |
 | S7 | OakInk and OakInk2 integration | External datasets | Separate adapters and tests | Required | Not started |
 | S8 | Export, benchmark, documentation and extensibility | Accepted prior stages | Export/benchmark docs and extension guide | Release review | Not started |

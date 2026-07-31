@@ -53,6 +53,11 @@ mesh-adjacent object surface patch. It never modifies raw GRAB, object
 trajectory, Stage B, or V1. See [contact contracts](CONTACT_CONTRACTS.md) and
 the [V2 handoff](HANDOFF_STAGE_C_CONTRACT_V2.md).
 
+Corrected C-XA Level-1 may enter dynamic acceptance only in a separate
+`stage_c_v2_dynamic` external namespace. The first full rollout failed D2, so
+MJWP, shared-profile smokes, HTML, screenshots, and Stage D remain prohibited;
+see [the dynamic handoff](HANDOFF_STAGE_C_V2_DYNAMIC.md).
+
 ## External source contract
 
 Stage A adds a separate, external workspace contract without changing the
