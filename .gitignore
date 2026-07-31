@@ -131,6 +131,7 @@ celerybeat.pid
 .env
 .env.local
 configs/local/
+.local_artifacts/
 .venv
 env/
 venv/
