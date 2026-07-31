@@ -120,6 +120,9 @@ work begins at S3. The detailed contract is in [WORKFLOW.md](docs/project/WORKFL
 - [Stage C contact contracts](docs/project/CONTACT_CONTRACTS.md)
 - [Stage C V2 handoff](docs/project/HANDOFF_STAGE_C_CONTRACT_V2.md)
 - [Stage C V2 dynamic handoff](docs/project/HANDOFF_STAGE_C_V2_DYNAMIC.md)
+- [Stage C V2R2E alignment](docs/project/STAGE_C_V2R2E_CONTACT_ALIGNMENT.md)
+- [Stage C V2R2E dynamic optimization](docs/project/STAGE_C_V2R2E_DYNAMIC_OPTIMIZATION.md)
+- [Stage C V2R2E handoff](docs/project/HANDOFF_STAGE_C_V2R2E.md)
 
 ## License and third-party assets
 

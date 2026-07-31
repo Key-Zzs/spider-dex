@@ -97,6 +97,9 @@ S2 只完成图中的目标机器人 embodiment；数据集 adapter 从 S3 开�
 - [Stage C 接触契约](docs/project/CONTACT_CONTRACTS.md)
 - [Stage C V2 交接](docs/project/HANDOFF_STAGE_C_CONTRACT_V2.md)
 - [Stage C V2 dynamic 交接](docs/project/HANDOFF_STAGE_C_V2_DYNAMIC.md)
+- [Stage C V2R2E 接触对齐](docs/project/STAGE_C_V2R2E_CONTACT_ALIGNMENT.md)
+- [Stage C V2R2E 动态优化](docs/project/STAGE_C_V2R2E_DYNAMIC_OPTIMIZATION.md)
+- [Stage C V2R2E 交接](docs/project/HANDOFF_STAGE_C_V2R2E.md)
 
 ## 许可证、致谢与引用
 

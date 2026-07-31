@@ -1,0 +1,98 @@
+# Stage C-V2R is deliberately separate from the preserved failed C-V2 profile.
+# It consumes the immutable C-XA Level-1 input and writes only stage_c_v2r
+# evidence.  The original 120-Hz duration is a hard contract in this profile.
+profile_name: grab_wuji_stage_c_v2r
+base_dynamic_config: configs/project/grab_wuji_stage_c_v2_dynamic.yaml
+contract_path: configs/project/grab_wuji_stage_c_contract_v2.yaml
+corrected_namespace: stage_c_contract_v2_cxa
+corrected_level: 1
+seed: 20260731
+timing:
+  variant: V2_ORIGINAL_TIMING
+  scale: 1.0
+  source_fps: 120.0
+physics:
+  sim_timestep_s: 0.0005
+  object_mocap_solref_s: 0.001
+  # Oracle C uses a much stiffer mocap weld but never writes object qpos.
+  oracle_c_kinematic_mocap_solref_s: 0.0001
+  robot_reference_lead_source_frames: 20
+  source_interval_scheduler: exact_accumulated_120hz
+oracle:
+  patch_distance_m: 0.020
+  patch_coverage: 0.70
+  functional_role_recall: 0.80
+  normal_cosine: 0.50
+  max_normalized_joint_delta: 0.25
+  max_robot_velocity_rad_s: 100.0
+  max_robot_acceleration_rad_s2: 20000.0
+  max_robot_jerk_rad_s3: 3000000.0
+  min_joint_margin_fraction: 0.001
+  collision_depth_m: 0.003
+  force_spike_n: 150.0
+  stable_hold_force_p95_multiplier: 2.0
+  stable_hold_force_max_multiplier: 1.0
+  stable_hold_force_impulse_multiplier: 1.0
+  object_position_max_m: 0.08
+  object_rotation_max_rad: 0.50
+  wrist_rmse_m: 0.03
+  fingertip_rmse_m: 0.08
+search:
+  max_candidates_per_branch: 12
+  timeout_s: 900
+  # Fixed before the formal R2 search.  Each candidate changes only the real
+  # position-controller profile; source frames, C-XA qpos, object guidance,
+  # and contact parameters stay immutable in this branch.  The first scalar
+  # audit is preserved externally but deliberately excluded from selection:
+  # it did not meet the required joint-specific-controller audit scope.
+  controller_candidates:
+    - {lead_source_frames: 0, kp_scale: 1.00, kv_scale: 1.00, force_limit_scale: 1.00}
+    - {lead_source_frames: 8, kp_scale: 1.00, kv_scale: 1.00, force_limit_scale: 1.00}
+    - {lead_source_frames: 16, kp_scale: 1.00, kv_scale: 1.00, force_limit_scale: 1.00}
+    - {lead_source_frames: 20, kp_scale: 1.00, kv_scale: 1.00, force_limit_scale: 1.00}
+    - {lead_source_frames: 8, kp_scale: 1.00, kv_scale: 1.00, force_limit_scale: 1.00, joint_kp_overrides: {37: 0.75, 38: 0.75, 41: 0.75}}
+    - {lead_source_frames: 8, kp_scale: 1.00, kv_scale: 1.00, force_limit_scale: 1.00, joint_kp_overrides: {37: 1.25, 38: 1.25, 41: 1.25}}
+    - {lead_source_frames: 12, kp_scale: 1.00, kv_scale: 1.00, force_limit_scale: 1.00, joint_kp_overrides: {37: 0.75, 38: 0.75, 41: 0.75}}
+    - {lead_source_frames: 16, kp_scale: 1.00, kv_scale: 1.00, force_limit_scale: 1.00, joint_kp_overrides: {37: 0.75, 38: 0.75, 41: 0.75}}
+    - {lead_source_frames: 12, kp_scale: 1.00, kv_scale: 1.00, force_limit_scale: 1.00, joint_kp_overrides: {6: 1.20, 7: 1.20, 11: 1.20, 37: 0.75, 38: 0.75, 41: 0.75}}
+    - {lead_source_frames: 8, kp_scale: 1.00, kv_scale: 1.00, force_limit_scale: 1.00, joint_kp_overrides: {6: 1.20, 7: 1.20, 11: 1.20, 37: 1.20, 38: 1.20, 41: 1.20}}
+  object_guidance_candidates: []
+  # Frozen Branch-D candidates.  They modify only explicit hand-object MuJoCo
+  # pair parameters in memory; controller gains, source object targets, and
+  # C-XA qpos stay fixed.  No negative margin/gap is allowed.
+  contact_dynamics_candidates:
+    - {candidate_id: baseline_pair, solref: [0.020, 1.00], solimp: [0.90, 0.95, 0.001, 0.50, 2.00], margin_m: 0.0000, gap_m: 0.0000, friction: [1.00, 1.00, 0.10, 0.00, 0.00]}
+    - {candidate_id: early_1mm, solref: [0.020, 1.00], solimp: [0.90, 0.95, 0.001, 0.50, 2.00], margin_m: 0.0010, gap_m: 0.0000, friction: [1.00, 1.00, 0.10, 0.00, 0.00]}
+    - {candidate_id: early_2mm, solref: [0.020, 1.00], solimp: [0.90, 0.95, 0.001, 0.50, 2.00], margin_m: 0.0020, gap_m: 0.0000, friction: [1.00, 1.00, 0.10, 0.00, 0.00]}
+    - {candidate_id: soft_30ms, solref: [0.030, 1.00], solimp: [0.80, 0.90, 0.002, 0.50, 2.00], margin_m: 0.0000, gap_m: 0.0000, friction: [1.00, 1.00, 0.10, 0.00, 0.00]}
+    - {candidate_id: soft_30ms_early_1mm, solref: [0.030, 1.00], solimp: [0.80, 0.90, 0.002, 0.50, 2.00], margin_m: 0.0010, gap_m: 0.0000, friction: [1.00, 1.00, 0.10, 0.00, 0.00]}
+    - {candidate_id: damped_20ms, solref: [0.020, 1.50], solimp: [0.85, 0.93, 0.002, 0.50, 2.00], margin_m: 0.0010, gap_m: 0.0000, friction: [1.00, 1.00, 0.10, 0.00, 0.00]}
+    - {candidate_id: low_friction_early_1mm, solref: [0.020, 1.00], solimp: [0.90, 0.95, 0.001, 0.50, 2.00], margin_m: 0.0010, gap_m: 0.0000, friction: [0.70, 0.70, 0.07, 0.00, 0.00]}
+    - {candidate_id: high_friction_damped, solref: [0.020, 1.50], solimp: [0.85, 0.93, 0.002, 0.50, 2.00], margin_m: 0.0010, gap_m: 0.0000, friction: [1.20, 1.20, 0.12, 0.00, 0.00]}
+r2:
+  window_length_frames: 414
+  overlap_frames: 0
+  shooting_horizon_frames: 0
+  loss_weights:
+    patch: 1.0
+    role: 1.0
+    tracking: 1.0
+    penetration: 1.0
+    contact_force: 1.0
+    joint_margin: 1.0
+    velocity: 1.0
+    acceleration: 1.0
+    jerk: 1.0
+    control: 1.0
+    object: 1.0
+  timeout_s: 900
+controller_feedforward_repair:
+  # One deterministic, non-search controller construction after the bounded
+  # jointwise sweep: inverse-dynamics seed plus bounded state feedback.
+  lead_source_frames: 8
+  inverse_dynamics_scale: 0.10
+  state_feedback_gain: 0.50
+  wrist_ctrl_offset_limit_rad: 0.03
+  finger_ctrl_offset_limit_rad: 0.12
+  wrist_state_feedback_limit_rad: 0.02
+  finger_state_feedback_limit_rad: 0.08

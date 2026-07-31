@@ -59,6 +59,14 @@ tracking but still failed dynamic V2-contact and robot-quality gates, so MJWP,
 shared-profile smokes, HTML, screenshots, and Stage D remain prohibited; see
 [the dynamic handoff](HANDOFF_STAGE_C_V2_DYNAMIC.md).
 
+Stage C-V2R2E continues this recovery in the isolated external
+`runs/stage_c_v2r2e/<attempt_id>/` namespace. Its alignment audit, bounded
+dynamic/contact-IK candidates, contact-dynamics and object-guidance branches,
+timing ladder, and recovery history are authoritative for that attempt.
+Original timing and relaxed timing are separate statuses; a relaxed result
+cannot be relabeled as original timing. D2, MJWP, smokes, HTML, screenshots,
+and Stage D remain primary-first and fail-closed.
+
 ## External source contract
 
 Stage A adds a separate, external workspace contract without changing the

@@ -1,0 +1,63 @@
+schema_version: 1
+profile_name: grab_wuji_stage_c_v2r2e
+base_dynamic_config: configs/project/grab_wuji_stage_c_v2_dynamic.yaml
+contract_path: configs/project/grab_wuji_stage_c_contract_v2.yaml
+regions_path: configs/project/wuji_hand2_contact_regions.yaml
+corrected_namespace: stage_c_contract_v2_cxa
+corrected_level: 1
+timing:
+  variant: V2_ORIGINAL_TIMING
+  scale: 1.0
+  source_fps: 120.0
+gates:
+  patch_distance_p95_m: 0.020
+  normal_cosine_median: 0.50
+  collision_max_m: 0.003
+  proxy_surface_offset_p95_m: 0.003
+  proxy_site_offset_m: 0.003
+  object_bbox_extent_ratio_min: 0.95
+  object_bbox_extent_ratio_max: 1.05
+  object_bbox_center_max_m: 0.005
+  max_visual_penetration_m: 0.010
+  visual_p95_penetration_m: 0.005
+  mean_negative_depth_m: 0.002
+  penetrating_vertex_ratio: 0.05
+  max_normalized_joint_delta: 0.25
+  object_position_max_m: 0.08
+  object_rotation_max_rad: 0.50
+search:
+  max_object_candidates: 4
+  max_hand_proxy_candidates: 4
+  max_mapping_candidates: 3
+  max_combined_geometry_candidates: 8
+  max_dynamic_optimizer_candidates: 12
+  max_object_guidance_candidates: 8
+  max_contact_dynamics_candidates: 8
+  max_mjwp_candidates: 12
+  max_d2_recovery_loops: 3
+  max_minimal_mjwp_recovery_loops: 3
+  max_visual_recovery_loops: 3
+  timing_variants: [1.0, 1.25, 1.5, 2.0]
+  object_guidance_candidates:
+    - {candidate_id: G0_current_baseline, pre_contact_solref_s: 0.0010, acquisition_solref_s: 0.0010, retention_solref_s: 0.0010, release_solref_s: 0.0010}
+    - {candidate_id: G1_precontact_strong, pre_contact_solref_s: 0.0005, acquisition_solref_s: 0.0008, retention_solref_s: 0.0010, release_solref_s: 0.0010}
+    - {candidate_id: G2_acquisition_ramp, pre_contact_solref_s: 0.0010, acquisition_solref_s: 0.0004, retention_solref_s: 0.0008, release_solref_s: 0.0010}
+    - {candidate_id: G3_contact_force_blend, pre_contact_solref_s: 0.0008, acquisition_solref_s: 0.0005, retention_solref_s: 0.0005, release_solref_s: 0.0010}
+    - {candidate_id: G4_phase_hysteresis, pre_contact_solref_s: 0.0005, acquisition_solref_s: 0.0005, retention_solref_s: 0.0008, release_solref_s: 0.0008}
+pilots:
+  primary:
+    sequence_id: s5__cylindermedium_lift
+    source_sequence: s5/cylindermedium_lift
+    frame_start: 1460
+    frame_end: 1876
+    required: true
+  smoke_1:
+    sequence_id: s1__mug_lift
+    source_sequence: s1/mug_lift
+    frame_start: 120
+    frame_end: 240
+  smoke_2:
+    sequence_id: s1__mug_offhand_1
+    source_sequence: s1/mug_offhand_1
+    frame_start: 120
+    frame_end: 180

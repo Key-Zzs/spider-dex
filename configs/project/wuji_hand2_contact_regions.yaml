@@ -1,0 +1,56 @@
+schema_version: 1
+robot: wuji_hand2_beta1
+contract: explicit_geom_to_region_mapping
+regions:
+  right:
+    thumb:
+      fingertip_site: right_thumb_tip
+      distal_geom: collision_hand_right_thumb_4
+      visual_mesh: r_thumb_distal
+      finger_geoms: [collision_hand_right_thumb_1, collision_hand_right_thumb_2, collision_hand_right_thumb_3, collision_hand_right_thumb_4]
+    index:
+      fingertip_site: right_index_tip
+      distal_geom: collision_hand_right_index_8
+      visual_mesh: r_index_finger_distal
+      finger_geoms: [collision_hand_right_index_5, collision_hand_right_index_6, collision_hand_right_index_7, collision_hand_right_index_8]
+    middle:
+      fingertip_site: right_middle_tip
+      distal_geom: collision_hand_right_middle_12
+      visual_mesh: r_middle_finger_distal
+      finger_geoms: [collision_hand_right_middle_9, collision_hand_right_middle_10, collision_hand_right_middle_11, collision_hand_right_middle_12]
+    ring:
+      fingertip_site: right_ring_tip
+      distal_geom: collision_hand_right_ring_16
+      visual_mesh: r_ring_finger_distal
+      finger_geoms: [collision_hand_right_ring_13, collision_hand_right_ring_14, collision_hand_right_middle_15, collision_hand_right_ring_16]
+    pinky:
+      fingertip_site: right_pinky_tip
+      distal_geom: collision_hand_right_pinky_20
+      visual_mesh: r_pinky_distal
+      finger_geoms: [collision_hand_right_pinky_17, collision_hand_right_pinky_18, collision_hand_right_middle_19, collision_hand_right_pinky_20]
+  left:
+    thumb:
+      fingertip_site: left_thumb_tip
+      distal_geom: collision_hand_left_thumb_4
+      visual_mesh: l_thumb_distal
+      finger_geoms: [collision_hand_left_thumb_1, collision_hand_left_thumb_2, collision_hand_left_thumb_3, collision_hand_left_thumb_4]
+    index:
+      fingertip_site: left_index_tip
+      distal_geom: collision_hand_left_index_8
+      visual_mesh: l_index_finger_distal
+      finger_geoms: [collision_hand_left_index_5, collision_hand_left_index_6, collision_hand_left_index_7, collision_hand_left_index_8]
+    middle:
+      fingertip_site: left_middle_tip
+      distal_geom: collision_hand_left_middle_12
+      visual_mesh: l_middle_finger_distal
+      finger_geoms: [collision_hand_left_middle_9, collision_hand_left_middle_10, collision_hand_left_middle_11, collision_hand_left_middle_12]
+    ring:
+      fingertip_site: left_ring_tip
+      distal_geom: collision_hand_left_ring_16
+      visual_mesh: l_ring_finger_distal
+      finger_geoms: [collision_hand_left_ring_13, collision_hand_left_ring_14, collision_hand_left_middle_15, collision_hand_left_ring_16]
+    pinky:
+      fingertip_site: left_pinky_tip
+      distal_geom: collision_hand_left_pinky_20
+      visual_mesh: l_pinky_distal
+      finger_geoms: [collision_hand_left_pinky_17, collision_hand_left_pinky_18, collision_hand_left_middle_19, collision_hand_left_pinky_20]

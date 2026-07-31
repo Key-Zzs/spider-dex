@@ -50,6 +50,22 @@ smokes, dynamic HTML, and screenshots are therefore **NOT_RUN**. See the
 [handoff](HANDOFF_STAGE_C_V2_DYNAMIC.md); do not use Stage-B or old-V2 HTML as
 substitutes.
 
+## Stage C-V2R2E physical-semantic and dynamic recovery
+
+The V2R2E alignment audit passed on the frozen primary, including explicit
+Wuji contact-region mapping, visual/collision correspondence, and patch-normal
+checks. The bounded recovery then ran 12 original-timing dynamic candidates,
+including four Jacobian contact-target profiles, five phase-scheduled
+object-guidance candidates, eight new in-memory contact-dynamics candidates,
+and an independent `1.0x`/`1.25x`/`1.5x`/`2.0x` timing ladder. No candidate
+passed the Oracle C gates, so the result is **BLOCKED before D2**.
+Minimal/Full MJWP, smokes, HTML, screenshots, and Stage D were correctly
+**NOT_RUN** under the primary-first contract.
+
+The aggregate decision is recorded at
+`/mnt/nas/storage/Ref2Dex_storage/spider_workspace/reports/stage_c_v2r2e_validation.json`;
+the complete handoff is [Stage C-V2R2E Handoff](HANDOFF_STAGE_C_V2R2E.md).
+
 ## Automated validation
 
 Run from the repository root:
