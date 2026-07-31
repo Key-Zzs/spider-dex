@@ -22,6 +22,8 @@ trajectory collections.
   manifest, and audit tooling: automated validation passed.
 - Stage B — bounded GRAB-to-Wuji kinematic pilots: automated pipeline passed;
   tracking-quality manual review remains pending.
+- Stage C — V1 exact contact remains blocked; bounded V2 task-equivalent
+  contact is also blocked on the frozen primary. Stage D has not started.
 
 No claim is made here that GRAB, OakInk, OakInk2, full physics optimization, or
 real-hardware validation has been completed.
@@ -113,6 +115,8 @@ work begins at S3. The detailed contract is in [WORKFLOW.md](docs/project/WORKFL
 - [Asset provenance](docs/project/ASSET_PROVENANCE.md)
 - [Validation and manual acceptance](docs/project/VALIDATION.md)
 - [Stage A/B handoff](docs/project/HANDOFF_STAGE_AB.md)
+- [Stage C contact contracts](docs/project/CONTACT_CONTRACTS.md)
+- [Stage C V2 handoff](docs/project/HANDOFF_STAGE_C_CONTRACT_V2.md)
 
 ## License and third-party assets
 

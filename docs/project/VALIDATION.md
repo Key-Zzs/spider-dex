@@ -28,6 +28,16 @@ is exceeded, so the accurate quality state is
 [manual acceptance](MANUAL_ACCEPTANCE_GRAB_WUJI.md). This is not a physics or
 contact-optimization result.
 
+## Stage C contract validation
+
+V1 exact source-finger contact remains
+`BLOCKED_BY_INFEASIBLE_EMBODIMENT_CONTACT`. V2 measures task-equivalent patch
+coverage and functional-role recall separately from V1 exact recall. All V2
+levels must pass static validity, penetration, tracking, patch, role, normal,
+and stability gates before any physical preflight or screenshots are allowed.
+The current bounded V2 ladder is blocked; see the external contract comparison
+and [V2 handoff](HANDOFF_STAGE_C_CONTRACT_V2.md).
+
 ## Automated validation
 
 Run from the repository root:

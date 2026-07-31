@@ -18,6 +18,7 @@ Wuji 手模型适配层。仓库只保存代码、机器人描述、配置与测
 - Stage A：外部数据路径、workspace、canonical HOI 契约、registry、manifest
   与审计工具，自动验证已通过。
 - Stage B：有界 GRAB 到 Wuji 运动学 pilot，自动流程已通过；追踪质量仍待人工复核。
+- Stage C：V1 精确接触仍被阻塞；冻结 primary 上有界的 V2 任务等价接触同样被阻塞，Stage D 尚未开始。
 
 当前没有声称已经完成 GRAB、OakInk、OakInk2 重定向、完整物理优化调参或
 真机验证。
@@ -92,6 +93,8 @@ S2 只完成图中的目标机器人 embodiment；数据集 adapter 从 S3 开�
 - [资产溯源](docs/project/ASSET_PROVENANCE.md)
 - [自动验证与人工验收](docs/project/VALIDATION.md)
 - [Stage A/B 交接](docs/project/HANDOFF_STAGE_AB.md)
+- [Stage C 接触契约](docs/project/CONTACT_CONTRACTS.md)
+- [Stage C V2 交接](docs/project/HANDOFF_STAGE_C_CONTRACT_V2.md)
 
 ## 许可证、致谢与引用
 

@@ -43,6 +43,16 @@ and robot qpos are `[right 26][left 26]`; a future generated object remains
 after those 52 robot coordinates. Full dataset adapters and physics optimization
 configuration are future stages, not an S2 claim.
 
+## Stage C contact contracts
+
+Stage C keeps two independent contracts. V1 requires the source hand, finger,
+and object patch exactly and is permanently blocked by the Wuji embodiment
+contact conflict. V2 permits only bounded, same-hand reassignment to a
+functional robot contact region while preserving source role, interval, and
+mesh-adjacent object surface patch. It never modifies raw GRAB, object
+trajectory, Stage B, or V1. See [contact contracts](CONTACT_CONTRACTS.md) and
+the [V2 handoff](HANDOFF_STAGE_C_CONTRACT_V2.md).
+
 ## External source contract
 
 Stage A adds a separate, external workspace contract without changing the
