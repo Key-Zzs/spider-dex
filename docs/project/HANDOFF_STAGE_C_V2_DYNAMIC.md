@@ -35,21 +35,34 @@ The separate dynamic output namespace is
 | HTML/screenshots/user review | NOT_RUN / NOT_AVAILABLE | no fabricated material |
 
 D1 ran five deterministic distinct frames, was finite and warning-free, with
-max qacc `7252.795`, max object translation drift `1.68e-05 m`, and max
-rotation drift `8.71e-04 rad`.
+max qacc `29272.873`, max object translation drift `1.96e-06 m`, and max
+rotation drift `3.45e-04 rad`.
 
-D2 was finite and warning-free but failed three gates:
+The original 2-ms/zero-lead failure is preserved below
+`attempts/baseline_dt002_lead0/`. A real 0.5-ms, exact-accumulated-120-Hz
+retry repaired its object failure without touching any C-XA frame: right-object
+position maximum is `6.45e-05 m`, rotation maximum `0.03991 rad`, and visual
+mesh penetration maximum `0.002190 m`.
 
-1. right-object rotation maximum `0.768767 rad` exceeds `0.50 rad`;
-2. real MuJoCo penetration persisted in four runs, maximum `0.005793 m`;
-3. robot tracking exceeded the wrist/fingertip thresholds (right palm RMSE
-   `0.063978 m`, right middle-tip RMSE `0.090402 m`).
+That repaired D2 still fails, so it does not authorize MJWP. Its required
+dynamic V2 contact result is patch coverage `0.255587` (minimum `0.70`),
+functional-role recall `0.0` (minimum `0.80`), and patch-distance P95
+`0.066588 m` (maximum `0.020 m`). The controller also has three robot
+joint-limit violations, a normalized one-frame delta of `0.296308` (maximum
+`0.25`), and persistent substep hand/object contacts: maximum depth
+`0.006424 m` and maximum force `337.631 N`. State, controls, warnings,
+object tracking, per-side robot RMS tracking, and visual-penetration gates
+remain finite/passing.
 
-The primary cause is in the immutable corrected object reference: consecutive
-right-object orientation changes of `1.350221 rad` at source frame 1854 and
-`1.413447 rad` at source frame 1858. Do not smooth/reselect/delete/replace
-those frames, move object qpos, modify raw GRAB, modify body models, overwrite
-Stage B, or overwrite C-XA. Such a change needs a new versioned contract.
+The current root cause is therefore **dynamic retention of the immutable
+Level-1 patch contract**, not the earlier object-orientation discontinuity.
+Read-only bounded controller probes (reference lead, servo Kp/force-limit,
+and Jacobian contact-target feedback) did not attain the V2 thresholds without
+introducing joint-limit, smoothness, collision, or numerical failures. Robot
+qpos rewrites, C-XA/contact-target edits, raw GRAB edits, object-qpos writes,
+and source-frame changes were not used. See
+`forward_rollout_failure_localization.json`; the current complete retry is
+also preserved under `attempts/fine_dt0005_lead20_simstep_gates/`.
 
 External aggregate reports are under `<workspace>/reports/`:
 `stage_c_v2_dynamic_validation.json`, `stage_c_v2_dynamic_pilot_summary.json`,
@@ -58,8 +71,8 @@ External aggregate reports are under `<workspace>/reports/`:
 
 ## Validation and entry criteria
 
-Focused dynamic, existing Stage-C preflight, and collision-audit tests passed
-(`25` tests), as did compileall and `git diff --check`.
+Focused dynamic and Stage-C preflight tests passed (`22` tests), as did
+compileall and `git diff --check`.
 
 Stage D entry still requires: primary dynamic PASS, both same-profile smokes
 PASS, Codex screenshot PASS, user HTML PASS, and frozen shared profiles. None

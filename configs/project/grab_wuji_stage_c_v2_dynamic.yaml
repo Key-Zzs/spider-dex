@@ -13,7 +13,14 @@ physics:
   # driven only through its mocap-weld reference; generalized object qpos is
   # never written after initialization.
   object_controller: mocap_weld_reference
-  substeps_per_source_frame: 4
+  # A fixed 2-ms step cannot physically track the frozen 120-Hz object
+  # orientation transitions.  This real-MuJoCo profile uses exact 120-Hz
+  # interval scheduling at 0.5 ms; no source frame is smoothed, skipped, or
+  # replaced.
+  sim_timestep_s: 0.0005
+  object_mocap_solref_s: 0.001
+  robot_reference_lead_source_frames: 20
+  source_interval_scheduler: exact_accumulated_120hz
   hold_seconds: 0.20
   source_fps: 120.0
 

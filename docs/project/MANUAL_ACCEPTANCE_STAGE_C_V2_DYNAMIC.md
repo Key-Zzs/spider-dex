@@ -2,9 +2,11 @@
 
 ## Current availability
 
-**NOT AVAILABLE.** The primary failed D2 full forward physics rollout, so no
-dynamic HTML or screenshots were generated. Opening a Stage-B or historical
-blocked-V2 page would not be a valid Stage C-V2 dynamic review.
+**NOT AVAILABLE.** The primary failed D2 full forward physics rollout after a
+real 0.5-ms retry: object tracking is stable, but immutable Level-1 V2 patch
+contact and substep robot-quality gates remain false. No dynamic HTML or
+screenshots were generated. Opening a Stage-B or historical blocked-V2 page
+would not be a valid Stage C-V2 dynamic review.
 
 If a future run passes D2 through D7, use only its new dynamic HTML and review:
 

@@ -36,20 +36,32 @@ All generated evidence is external under
 | D7 HTML/screenshots | NOT_RUN | no false visual acceptance evidence |
 
 The D1 five distinct deterministic source frames had finite state, zero
-warnings, maximum qacc `7252.795`, maximum object translation drift
-`1.68e-05 m`, and maximum object rotation drift `8.71e-04 rad`.
+warnings, maximum qacc `29272.873`, maximum object translation drift
+`1.96e-06 m`, and maximum object rotation drift `3.45e-04 rad`.
 
-D2 remained finite and warning-free, but failed object tracking (right-object
-rotation maximum `0.768767 rad` against `0.50 rad`), repeated real MuJoCo
-hand-object penetration (maximum `0.005793 m`), and robot tracking. The D2
-localization records two immutable corrected object-reference single-frame
-orientation discontinuities: `1.350221 rad` at source frame 1854 and
-`1.413447 rad` at source frame 1858. Smoothing, replacing, deleting, or
-moving this frozen trajectory would violate the Stage C-V2 contract.
+The preserved original 2-ms/zero-lead D2 failure is retained at
+`attempts/baseline_dt002_lead0/`. A second real-MuJoCo attempt uses a 0.5-ms
+integration step with exact accumulated 120-Hz scheduling. It preserves every
+frozen C-XA source frame, drives objects only through the mocap weld, and
+repairs the former object-tracking failure: right-object rotation maximum is
+`0.03991 rad`, visual maximum penetration is `0.002190 m`, and all states are
+finite with zero warnings.
+
+The retry is nevertheless **FAIL** at D2. Its actual physical V2 result is
+patch coverage `0.255587` (required `>= 0.70`), functional-role recall `0.0`
+(required `>= 0.80`), and patch-distance P95 `0.066588 m` (required
+`<= 0.020 m`). At real integration-step resolution it also has three
+robot-joint-limit violations, a `0.296308` normalized single-frame joint
+delta, persistent hand/object collision depth up to `0.006424 m`, and
+exponential contact-force-growth evidence. Bounded read-only probes of phase
+lead, servo Kp/force limits, and Jacobian contact feedback did not obtain a
+profile satisfying every D2 gate. The complete attempt is preserved at
+`attempts/fine_dt0005_lead20_simstep_gates/`; its diagnosis is
+`forward_rollout_failure_localization.json`.
 
 ## Stop boundary
 
 No MJWP candidate, profile selection, smoke, HTML, screenshot, user review,
-or Stage D claim is valid from this result. A future scoped task must decide
-whether a new versioned dynamic object-continuity contract is permitted;
-it cannot alter or reinterpret this C-XA/Stage-C-V2 evidence.
+or Stage D claim is valid from this result. A future scoped task would need a
+new, explicitly versioned dynamic contact/controller contract; it cannot
+alter or reinterpret this C-XA/Stage-C-V2 evidence.

@@ -19,7 +19,7 @@ Wuji 手模型适配层。仓库只保存代码、机器人描述、配置与测
   与审计工具，自动验证已通过。
 - Stage B：有界 GRAB 到 Wuji 运动学 pilot，自动流程已通过；追踪质量仍待人工复核。
 - Stage C：V1 精确接触仍被阻塞。C-XA 修正后的 V2 Level-1 静态验收已通过，
-  但首次动态完整 rollout 在 D2 失败；MJWP、smoke、HTML、截图和 Stage D 均未开始。
+  但动态 D2 仍为失败关闭：细步长重试修复了物体跟踪，未能满足 V2 接触与机器人质量门槛；MJWP、smoke、HTML、截图和 Stage D 均未开始。
 
 当前没有声称已经完成 GRAB、OakInk、OakInk2 重定向、完整物理优化调参或
 真机验证。

@@ -23,7 +23,8 @@ trajectory collections.
 - Stage B — bounded GRAB-to-Wuji kinematic pilots: automated pipeline passed;
   tracking-quality manual review remains pending.
 - Stage C — V1 exact contact remains blocked. C-XA corrected V2 Level-1
-  static acceptance passed, but the first dynamic full rollout failed D2;
+  static acceptance passed, but dynamic D2 remains fail-closed after a
+  fine-step retry repaired object tracking but not V2 contact/robot quality;
   MJWP, smokes, HTML, screenshots, and Stage D have not started.
 
 No claim is made here that GRAB, OakInk, OakInk2, full physics optimization, or
