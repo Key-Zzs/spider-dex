@@ -1,0 +1,77 @@
+# Embodiment-aware Stage C-X contract.  This is deliberately independent of
+# the immutable V1 exact-source-finger contract and its MJWP profile.
+contract_name: TASK_EQUIVALENT_CONTACT
+contract_version: 2
+parent_contract: EXACT_SOURCE_FINGER_CONTACT_V1
+profile_name: grab_wuji_stage_c_contract_v2
+source_contract_file: configs/project/grab_wuji_stage_c_contract.yaml
+depenetration_profile_file: configs/project/grab_wuji_depenetration.yaml
+mjwp_profile_file: configs/project/grab_wuji_stage_c.yaml
+
+# All levels are bounded and must be attempted in this order.  A later level
+# cannot be selected when an earlier level has a full physical PASS.
+relaxation_levels:
+  - {level: 0, name: EXACT_IDENTITY, same_side: true, same_finger: true, same_patch: true}
+  - {level: 1, name: SAME_FINGER_FLEXIBLE_CONTACT_POINT, same_side: true, same_finger: true, same_patch: true}
+  - {level: 2, name: SAME_FUNCTIONAL_FINGER_GROUP, same_side: true, thumb_must_remain_thumb: true, same_patch: true}
+  - {level: 3, name: SAME_HAND_TASK_EQUIVALENT_CONTACT_SET, same_side: true, thumb_must_remain_thumb: true, adjacent_patch_only: true}
+  - {level: 4, name: TASK_EQUIVALENT_SURFACE_GRASP, same_side: true, thumb_must_remain_thumb: true, functional_surface_only: true}
+
+non_thumb_neighbors:
+  index: [index, middle]
+  middle: [index, middle, ring]
+  ring: [middle, ring, pinky]
+  pinky: [ring, pinky]
+
+patches:
+  core_radius_m: 0.012
+  extended_radius_m: 0.025
+  normal_cosine_min: 0.5
+  thin_wall_normal_cosine_min: 0.0
+  require_mesh_adjacency: true
+
+assignment:
+  window_frames: 60
+  overlap_frames: 20
+  max_switches_per_second: 2.0
+  minimum_patch_separation_m: 0.020
+  region_capacity: 1
+  weights:
+    surface_patch: 4.0
+    normal: 1.0
+    functional_role: 12.0
+    identity_change: 1.5
+    reachability: 2.0
+    collision_risk: 8.0
+    tracking_deviation: 1.0
+    temporal_switch: 8.0
+
+acceptance:
+  exact_contact_recall_v1_report_only: true
+  task_equivalent_patch_coverage: 0.70
+  functional_role_recall: 0.80
+  patch_distance_m: 0.015
+  patch_distance_p95_m: 0.020
+  normal_cosine_median: 0.50
+  max_switches_per_second: 2.0
+  depenetrated_visual_max_m: 0.003
+  depenetrated_visual_p95_m: 0.002
+  depenetrated_collision_max_m: 0.003
+  optimized_visual_max_m: 0.010
+  optimized_visual_p95_m: 0.005
+  optimized_visual_mean_negative_m: 0.002
+  optimized_visual_penetrating_vertex_ratio: 0.05
+  optimized_frame_visual_max_m: 0.020
+  wrist_rmse_m: 0.03
+  fingertip_rmse_m: 0.08
+  object_pos_rmse_m: 0.03
+  object_pos_max_m: 0.08
+  object_rot_mean_rad: 0.20
+  object_rot_max_rad: 0.50
+
+# Same profile for every frozen pilot.  Only the primary may perform the
+# bounded level search; smokes run only after a selected primary level passes.
+frozen_pilots:
+  - {sequence_id: s5__cylindermedium_lift, frame_range: [1460, 1876], role: true_bimanual_primary}
+  - {sequence_id: s1__mug_lift, frame_range: [120, 240], role: right_hand_smoke}
+  - {sequence_id: s1__mug_offhand_1, frame_range: [120, 180], role: offhand_smoke}
