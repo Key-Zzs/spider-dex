@@ -107,6 +107,42 @@ def setup_mj_model(config: Config) -> mujoco.MjModel:
     return model_cpu
 
 
+def _apply_robot_servo_profile(model_cpu: mujoco.MjModel, config: Config) -> None:
+    """Apply the configured Stage-C robot servo profile before Warp upload.
+
+    Only the 52 named robot position actuators may be changed.  Scaling their
+    proportional and damping terms together preserves the intended position
+    servo form; object actuators, qpos references, and collision geometry are
+    deliberately untouched.
+    """
+    base_kp = float(config.robot_servo_kp_scale)
+    base_force = float(config.robot_servo_forcelimit_scale)
+    wrist_kp = base_kp if config.robot_wrist_servo_kp_scale is None else float(config.robot_wrist_servo_kp_scale)
+    wrist_force = base_force if config.robot_wrist_servo_forcelimit_scale is None else float(config.robot_wrist_servo_forcelimit_scale)
+    finger_kp = base_kp if config.robot_finger_servo_kp_scale is None else float(config.robot_finger_servo_kp_scale)
+    finger_force = base_force if config.robot_finger_servo_forcelimit_scale is None else float(config.robot_finger_servo_forcelimit_scale)
+    if min(base_kp, base_force, wrist_kp, wrist_force, finger_kp, finger_force) <= 0.0:
+        raise ValueError("robot servo profile scales must be positive")
+    if wrist_kp == wrist_force == finger_kp == finger_force == 1.0:
+        return
+    changed = 0
+    for actuator_id in range(model_cpu.nu):
+        name = mujoco.mj_id2name(model_cpu, mujoco.mjtObj.mjOBJ_ACTUATOR, actuator_id) or ""
+        is_wrist = name.startswith(("right_wrist_", "left_wrist_"))
+        is_finger = name.startswith(("r_", "l_"))
+        if not (is_wrist or is_finger):
+            continue
+        kp_scale = wrist_kp if is_wrist else finger_kp
+        force_scale = wrist_force if is_wrist else finger_force
+        model_cpu.actuator_gainprm[actuator_id, 0] *= kp_scale
+        model_cpu.actuator_biasprm[actuator_id, 1:3] *= kp_scale
+        if model_cpu.actuator_forcelimited[actuator_id]:
+            model_cpu.actuator_forcerange[actuator_id] *= force_scale
+        changed += 1
+    if changed != 52:
+        raise RuntimeError(f"Expected 52 named robot servos, scaled {changed}")
+
+
 def _seed_object_mocap_references(
     model_cpu: mujoco.MjModel, data_cpu: mujoco.MjData, qpos_init: np.ndarray
 ) -> None:
@@ -129,8 +165,44 @@ def _seed_object_mocap_references(
             raise RuntimeError(f"{target_name} exists but is not a mocap body")
         data_cpu.mocap_pos[mocap_id] = qpos_init[offset : offset + 3]
         quat = np.empty(4, dtype=np.float64)
-        mujoco.mju_euler2Quat(quat, qpos_init[offset + 3 : offset + 6], "XYZ")
+        # MuJoCo's helper uses lowercase for the intrinsic sequence matching
+        # SciPy ``Rotation.from_euler("XYZ", ...)`` used by the serial-hinge
+        # Stage-C scene convention.
+        mujoco.mju_euler2Quat(quat, qpos_init[offset + 3 : offset + 6], "xyz")
         data_cpu.mocap_quat[mocap_id] = quat
+
+
+def set_object_mocap_reference(
+    config: Config, env: MJWPEnv, qpos_reference: torch.Tensor
+) -> MJWPEnv:
+    """Update optional object mocaps from a reference pose for every Warp world.
+
+    This is a physical constraint target for Stage C object tracking.  It does
+    not touch dynamic qpos/qvel and is a no-op for ordinary scenes without the
+    named Stage-C targets.
+    """
+    reference = qpos_reference.detach().cpu().numpy().astype(np.float64, copy=False)
+    if reference.ndim != 1 or reference.shape[0] < 64:
+        return env
+    positions = wp.to_torch(env.data_wp.mocap_pos).clone()
+    quaternions = wp.to_torch(env.data_wp.mocap_quat).clone()
+    changed = False
+    for target_name, offset in (("right_object_mocap_target", 52), ("left_object_mocap_target", 58)):
+        body_id = int(mujoco.mj_name2id(env.model_cpu, mujoco.mjtObj.mjOBJ_BODY, target_name))
+        if body_id < 0:
+            continue
+        mocap_id = int(env.model_cpu.body_mocapid[body_id])
+        if mocap_id < 0:
+            raise RuntimeError(f"{target_name} exists but is not a mocap body")
+        quat = np.empty(4, dtype=np.float64)
+        mujoco.mju_euler2Quat(quat, reference[offset + 3 : offset + 6], "xyz")
+        positions[:, mocap_id] = torch.as_tensor(reference[offset : offset + 3], device=config.device, dtype=positions.dtype)
+        quaternions[:, mocap_id] = torch.as_tensor(quat, device=config.device, dtype=quaternions.dtype)
+        changed = True
+    if changed:
+        wp.copy(env.data_wp.mocap_pos, wp.from_torch(positions))
+        wp.copy(env.data_wp.mocap_quat, wp.from_torch(quaternions))
+    return env
 
 
 def setup_env(config: Config, ref_data: tuple[torch.Tensor, ...]) -> MJWPEnv:
@@ -142,6 +214,7 @@ def setup_env(config: Config, ref_data: tuple[torch.Tensor, ...]) -> MJWPEnv:
 
     # CPU model/data
     model_cpu = setup_mj_model(config)
+    _apply_robot_servo_profile(model_cpu, config)
     data_cpu = mujoco.MjData(model_cpu)
     # Seed initial state
     arrs = (qpos_init, qvel_ref[0], ctrl_ref[0])
@@ -642,6 +715,64 @@ def _run_sanity_check_body(
     raise RuntimeError("\n".join(msg_parts))
 
 
+def _contact_tracking_reward(
+    contact_pos: torch.Tensor,
+    contact_pos_ref: torch.Tensor,
+    contact_ref: torch.Tensor,
+    scale: float,
+    deadzone_m: float = 0.0,
+) -> torch.Tensor:
+    """Return the scaled source-contact tracking reward for each world.
+
+    A positive deadzone rewards reaching the accepted contact neighborhood
+    without encouraging further motion through the object surface.
+    """
+    if scale < 0.0 or deadzone_m < 0.0:
+        raise ValueError("contact reward scale and deadzone must be non-negative")
+    contact_dist = torch.norm(contact_pos - contact_pos_ref, p=2, dim=-1)
+    excess = torch.relu(contact_dist - float(deadzone_m))
+    return -float(scale) * (excess * contact_ref.unsqueeze(0)).sum(dim=1)
+
+
+def _hand_object_collision_penalty(
+    contact_dist: torch.Tensor,
+    contact_geom: torch.Tensor,
+    contact_worldid: torch.Tensor,
+    num_worlds: int,
+    hand_geom_ids: list[int],
+    object_geom_ids: list[int],
+    scale: float,
+    margin_m: float,
+) -> torch.Tensor:
+    """Return a per-world soft cost for real hand/object interpenetration.
+
+    MJWarp stores contacts in a flat, world-indexed array.  We filter it by
+    the compiled scene's collision IDs before accumulating a squared excess
+    depth; padded/non-hand contacts contribute exactly zero.
+    """
+    if scale < 0.0 or margin_m < 0.0:
+        raise ValueError("collision reward scale and margin must be non-negative")
+    result = torch.zeros(num_worlds, device=contact_dist.device, dtype=contact_dist.dtype)
+    if scale == 0.0 or not hand_geom_ids or not object_geom_ids:
+        return result
+    if contact_geom.ndim != 2 or contact_geom.shape[1] != 2:
+        raise ValueError(f"Expected contact geom shape (N, 2), got {tuple(contact_geom.shape)}")
+    if contact_dist.ndim != 1 or contact_worldid.shape != contact_dist.shape:
+        raise ValueError("MJWarp contact distance/world-id shape mismatch")
+    hand = torch.as_tensor(hand_geom_ids, device=contact_geom.device, dtype=contact_geom.dtype)
+    obj = torch.as_tensor(object_geom_ids, device=contact_geom.device, dtype=contact_geom.dtype)
+    first_hand, second_hand = torch.isin(contact_geom[:, 0], hand), torch.isin(contact_geom[:, 1], hand)
+    first_object, second_object = torch.isin(contact_geom[:, 0], obj), torch.isin(contact_geom[:, 1], obj)
+    pair = (first_hand & second_object) | (second_hand & first_object)
+    valid_world = (contact_worldid >= 0) & (contact_worldid < num_worlds)
+    active = pair & valid_world
+    if not bool(active.any()):
+        return result
+    depth_excess = torch.relu(-contact_dist[active] - float(margin_m))
+    values = float(scale) * depth_excess.square()
+    return result.scatter_add(0, contact_worldid[active].to(torch.long), values)
+
+
 def get_reward(
     config: Config,
     env: MJWPEnv,
@@ -673,19 +804,37 @@ def get_reward(
     if config.contact_rew_scale > 0.0 and len(config.contact_site_ids) > 0:
         site_xpos_torch = wp.to_torch(env.data_wp.site_xpos)
         contact_pos = site_xpos_torch[:, config.contact_site_ids]
-        contact_dist = torch.norm(contact_pos - contact_pos_ref, p=2, dim=-1)
-        contact_dist_masked = contact_dist * contact_ref.unsqueeze(0)
-        contact_rew = -contact_dist_masked.sum(dim=1)
+        contact_rew = _contact_tracking_reward(
+            contact_pos,
+            contact_pos_ref,
+            contact_ref,
+            config.contact_rew_scale,
+            config.contact_rew_deadzone_m,
+        )
     else:
         contact_rew = 0.0
 
-    reward = qpos_rew + qvel_rew + contact_rew
+    collision_rew = torch.zeros_like(qpos_rew)
+    if config.collision_rew_scale > 0.0:
+        collision_rew = _hand_object_collision_penalty(
+            wp.to_torch(env.data_wp.contact.dist),
+            wp.to_torch(env.data_wp.contact.geom),
+            wp.to_torch(env.data_wp.contact.worldid),
+            qpos_sim.shape[0],
+            config.collision_hand_geom_ids,
+            config.collision_object_geom_ids,
+            config.collision_rew_scale,
+            config.collision_rew_margin_m,
+        )
+
+    reward = qpos_rew + qvel_rew + contact_rew - collision_rew
 
     info = {
         "qpos_dist": qpos_dist,
         "qvel_dist": qvel_dist,
         "qpos_rew": qpos_rew,
         "qvel_rew": qvel_rew,
+        "collision_rew": collision_rew,
     }
     return reward, info
 
@@ -862,6 +1011,7 @@ def compute_contact_point_delta(
     site_xpos: torch.Tensor,
     hand_contact_site_ids: list[int | None],
     contact_indices: list[int],
+    strategy: str = "mean",
 ) -> torch.Tensor | None:
     """Compute mean contact position delta for a hand (current - reference).
 
@@ -886,9 +1036,16 @@ def compute_contact_point_delta(
     if not current_positions:
         return None
 
-    current_mean = torch.stack(current_positions, dim=0).mean(dim=0)
-    reference_mean = torch.stack(reference_positions, dim=0).mean(dim=0)
-    return current_mean - reference_mean
+    current = torch.stack(current_positions, dim=0)
+    reference = torch.stack(reference_positions, dim=0)
+    if strategy == "mean":
+        return current.mean(dim=0) - reference.mean(dim=0)
+    if strategy == "first_active":
+        return current[0] - reference[0]
+    if strategy == "nearest_active":
+        index = torch.argmin(torch.norm(current - reference, dim=1))
+        return current[index] - reference[index]
+    raise ValueError(f"Unknown contact wrist feedback strategy: {strategy}")
 
 
 def get_trace(config: Config, env: MJWPEnv) -> torch.Tensor:

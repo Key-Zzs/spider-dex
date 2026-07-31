@@ -79,6 +79,10 @@ class Config:
     perturb_force: float = 0.0
     perturb_torque: float = 0.0
     contact_guidance: bool = False
+    # A fail-closed escape hatch for a deliberately non-contact infrastructure
+    # probe.  Normal contact-guided optimization, including every benchmark
+    # sequence, must retain the all-zero contact-mask rejection in run_mjwp.
+    allow_empty_contact_guidance: bool = False
     object_pos_actuator_names: list[str] = field(
         default_factory=lambda: [
             "right_object_pos_x",
@@ -107,6 +111,83 @@ class Config:
     init_rot_actuator_gain: float = 0.1
     init_rot_actuator_bias: float = 0.1
     guidance_decay_ratio: float = 0.5
+    # Disabled by default.  Stage-C primary profile search may explicitly use
+    # bounded object position actuators in addition to its mocap-weld target.
+    allow_object_actuator_guidance: bool = False
+    # Optional anticipatory robot controller.  It affects only the 52 robot
+    # actuator targets and never the physical object qpos/reference.
+    robot_reference_lookahead_steps: int = 0
+    # Optional shared Stage-C refinements for the two robot actuator groups.
+    # ``None`` inherits the legacy all-robot lookahead.  They make the
+    # wrist/finger phase contract explicit without changing object controls.
+    robot_wrist_reference_lookahead_steps: int | None = None
+    robot_finger_reference_lookahead_steps: int | None = None
+    # Optional bounded state-error correction for the robot position targets.
+    # It reads only the current physical robot state and the source reference
+    # at the current simulation time.  In particular, it is not an object
+    # state rewrite or a per-sequence trajectory edit.
+    robot_state_feedback_gain: float = 0.0
+    robot_state_feedback_wrist_translation_clip_m: float = 0.0
+    robot_state_feedback_wrist_rotation_clip_rad: float = 0.0
+    robot_state_feedback_finger_clip_rad: float = 0.0
+    # Scale for the legacy per-hand mean contact correction.  Stage-C profile
+    # search may set this to zero to isolate the source control trajectory;
+    # the default preserves existing contact-guidance behavior.
+    contact_wrist_mean_feedback_gain: float = 1.0
+    # ``mean`` reproduces the legacy aggregate. ``first_active`` uses the
+    # first source-ordered active fingertip, avoiding a wrist correction that
+    # averages mutually incompatible multi-finger surface anchors.
+    contact_wrist_mean_feedback_strategy: str = "mean"
+    # Optional low-level contact servo.  Unlike the sampling optimizer this
+    # uses the current physical site positions and source-only surface anchors
+    # to make a bounded, per-hand differential IK correction.  It is disabled
+    # unless a Stage-C profile explicitly opts in.
+    contact_ik_feedback_gain: float = 0.0
+    # Do not let a local Jacobian servo take over global tracking for an
+    # already-lost fingertip.  Only source-active anchors within this radius
+    # participate; infinity preserves the original unguarded behavior.
+    contact_ik_feedback_max_anchor_error_m: float = float("inf")
+    # ``all_active`` solves all source-active fingers jointly. ``first_active``
+    # gives one high-priority source-ordered finger per hand the full bounded
+    # local correction, avoiding an underactuated equal-weight compromise.
+    contact_ik_feedback_strategy: str = "all_active"
+    # When enabled, inject the bounded contact-Jacobian correction into the
+    # immediate optimizer controls rather than adding it only after planning.
+    # This lets the real MJWP rollout score its physical consequence.
+    contact_ik_feedback_apply_to_plan: bool = False
+    # Optional bounded integral term for the same source-only contact
+    # Jacobian correction.  It compensates servo lag across control ticks and
+    # decays immediately when a hand has no active source contact.
+    contact_ik_integral_gain: float = 0.0
+    contact_ik_integral_decay: float = 0.98
+    contact_ik_feedback_damping: float = 0.002
+    contact_ik_feedback_wrist_translation_clip_m: float = 0.0
+    contact_ik_feedback_wrist_rotation_clip_rad: float = 0.0
+    contact_ik_feedback_finger_clip_rad: float = 0.0
+    # Project a source-anchor IK correction into the non-penetrating tangent
+    # half-space of *current* MuJoCo hand/object contacts.  Zero disables the
+    # projection.  This is a robot-target controller constraint, never a
+    # qpos/object-state correction.
+    contact_ik_collision_barrier_gain: float = 0.0
+    contact_ik_collision_barrier_margin_m: float = 0.0
+    contact_ik_collision_barrier_max_contacts: int = 16
+    # Shared Stage-C robot-servo profile.  These are applied to the actual
+    # MuJoCo/MJWarp position servos during environment construction, never to
+    # qpos references or object actuators.
+    robot_servo_kp_scale: float = 1.0
+    robot_servo_forcelimit_scale: float = 1.0
+    robot_wrist_servo_kp_scale: float | None = None
+    robot_wrist_servo_forcelimit_scale: float | None = None
+    robot_finger_servo_kp_scale: float | None = None
+    robot_finger_servo_forcelimit_scale: float | None = None
+    # Optional soft penalty used by Stage-C profile search.  It is evaluated
+    # from real MuJoCo hand/object collision contacts during each sampled
+    # rollout; the independent C-R4 collision gate remains the final check.
+    collision_rew_scale: float = 0.0
+    collision_rew_margin_m: float = 0.001
+    contact_rew_deadzone_m: float = 0.0
+    collision_hand_geom_ids: list[int] = field(default_factory=list)
+    collision_object_geom_ids: list[int] = field(default_factory=list)
     gibbs_sampling: bool = False
 
     # === OPTIMIZER CONFIGURATION ===
@@ -173,6 +254,8 @@ class Config:
     left_contact_indices: list = field(default_factory=list)
     right_pos_ctrl_ids: list = field(default_factory=list)
     left_pos_ctrl_ids: list = field(default_factory=list)
+    right_wrist_pos_ctrl_ids: list = field(default_factory=list)
+    left_wrist_pos_ctrl_ids: list = field(default_factory=list)
     contact_len: int = 0
 
     # === AUTOMATICALLY SET PROPERTIES ===
@@ -479,18 +562,41 @@ def process_config(config: Config):
             config.right_pos_ctrl_ids, config.left_pos_ctrl_ids = (
                 get_object_pos_ctrl_indices(config)
             )
+            actuator_name_to_id = {
+                mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_ACTUATOR, index): index
+                for index in range(model.nu)
+            }
+            for side in ("right", "left"):
+                names = [f"{side}_wrist_{axis}_actuator" for axis in ("tx", "ty", "tz")]
+                ids = [actuator_name_to_id.get(name) for name in names]
+                if any(index is None for index in ids):
+                    raise RuntimeError(f"Missing {side} wrist translation actuators: {names}")
+                setattr(config, f"{side}_wrist_pos_ctrl_ids", [int(index) for index in ids])
             config.contact_order, config.hand_contact_site_ids = (
                 build_hand_contact_site_ids(model, config.embodiment_type)
             )
+            config.collision_hand_geom_ids = [
+                geom_id
+                for geom_id in range(model.ngeom)
+                if model.geom_group[geom_id] == 2
+                and model.geom_type[geom_id] == mujoco.mjtGeom.mjGEOM_MESH
+                and (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, int(model.geom_bodyid[geom_id])) or "").startswith(("r_", "l_"))
+            ]
+            config.collision_object_geom_ids = [
+                geom_id
+                for geom_id in range(model.ngeom)
+                if model.geom_group[geom_id] == 3
+                and (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id) or "").startswith("right_object_")
+            ]
             config.right_contact_indices = [
                 idx
-                for idx, (side, finger) in enumerate(config.contact_order)
-                if (side == "right") and (finger in ["thumb"])
+                for idx, (side, _finger) in enumerate(config.contact_order)
+                if side == "right"
             ]
             config.left_contact_indices = [
                 idx
-                for idx, (side, finger) in enumerate(config.contact_order)
-                if side == "left" and (finger in ["thumb"])
+                for idx, (side, _finger) in enumerate(config.contact_order)
+                if side == "left"
             ]
 
     # get noise scale

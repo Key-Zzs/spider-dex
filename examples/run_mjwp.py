@@ -56,6 +56,7 @@ from spider.simulators.mjwp import (
     load_state,
     save_env_params,
     save_state,
+    set_object_mocap_reference,
     setup_env,
     setup_mj_model,  # mjwp specific
     step_env,
@@ -106,7 +107,7 @@ def _extract_cli_overrides(cfg: DictConfig) -> dict:
 def _assert_object_actuator_gains_zero(
     env, config: Config, stage: str, atol: float = 1e-4
 ) -> None:
-    if not config.contact_guidance or not config.object_actuator_ids:
+    if config.allow_object_actuator_guidance or not config.contact_guidance or not config.object_actuator_ids:
         return
     actuator_ids = np.asarray(config.object_actuator_ids, dtype=int)
     if not hasattr(env, "model_wp") or not hasattr(env.model_wp, "actuator_gainprm"):
@@ -125,6 +126,292 @@ def _assert_object_actuator_gains_zero(
     assert np.allclose(kd, 0.0, atol=atol), (
         f"Object actuator Kd not near zero at {stage}: max={np.max(np.abs(kd))}"
     )
+
+
+def _robot_reference_controls(
+    ctrl_ref: torch.Tensor,
+    start: int,
+    length: int,
+    lookahead_steps: int,
+    wrist_lookahead_steps: int | None = None,
+    finger_lookahead_steps: int | None = None,
+) -> torch.Tensor:
+    """Return a shared optional phase lead for robot actuators only."""
+    if lookahead_steps < 0:
+        raise ValueError("robot reference lookahead must be non-negative")
+    wrist_lead = lookahead_steps if wrist_lookahead_steps is None else wrist_lookahead_steps
+    finger_lead = lookahead_steps if finger_lookahead_steps is None else finger_lookahead_steps
+    if wrist_lead < 0 or finger_lead < 0:
+        raise ValueError("robot group lookaheads must be non-negative")
+    indices = torch.arange(start, start + length, device=ctrl_ref.device).clamp(
+        max=ctrl_ref.shape[0] - 1
+    )
+    controls = ctrl_ref[indices].clone()
+    for lead, actuator_ids in (
+        (wrist_lead, (slice(0, 6), slice(26, 32))),
+        (finger_lead, (slice(6, 26), slice(32, 52))),
+    ):
+        if lead <= 0:
+            continue
+        future = ctrl_ref[(indices + lead).clamp(max=ctrl_ref.shape[0] - 1)]
+        for actuator_id in actuator_ids:
+            controls[:, actuator_id] = future[:, actuator_id]
+    return controls
+
+
+def _bounded_robot_state_feedback(
+    reference_qpos: torch.Tensor,
+    physical_qpos: torch.Tensor,
+    gain: float,
+    wrist_translation_clip_m: float,
+    wrist_rotation_clip_rad: float,
+    finger_clip_rad: float,
+) -> torch.Tensor:
+    """Return a bounded robot-only position-target correction.
+
+    The correction is deliberately computed from the *current* source frame,
+    rather than a future controller reference.  This gives the position
+    servos a bounded way to reject accumulated physical-state error without
+    advancing the object or silently shifting the source phase.  The trailing
+    object coordinates are always exactly zero in the returned tensor.
+    """
+    if reference_qpos.ndim != 1 or physical_qpos.ndim != 1:
+        raise ValueError("robot state feedback expects one-dimensional qpos tensors")
+    if reference_qpos.shape != physical_qpos.shape or reference_qpos.numel() < 52:
+        raise ValueError("robot state feedback qpos shape mismatch")
+    if gain < 0.0:
+        raise ValueError("robot state feedback gain must be non-negative")
+    clips = (wrist_translation_clip_m, wrist_rotation_clip_rad, finger_clip_rad)
+    if any(value < 0.0 for value in clips):
+        raise ValueError("robot state feedback clips must be non-negative")
+    correction = torch.zeros_like(reference_qpos)
+    if gain == 0.0 or not any(value > 0.0 for value in clips):
+        return correction
+    error = (reference_qpos[:52] - physical_qpos[:52]) * float(gain)
+    for target, slices, clip in (
+        (correction, (slice(0, 3), slice(26, 29)), wrist_translation_clip_m),
+        (correction, (slice(3, 6), slice(29, 32)), wrist_rotation_clip_rad),
+        (correction, (slice(6, 26), slice(32, 52)), finger_clip_rad),
+    ):
+        if clip <= 0.0:
+            continue
+        for coordinates in slices:
+            target[coordinates] = torch.clip(error[coordinates], -float(clip), float(clip))
+    return correction
+
+
+def _bounded_damped_least_squares(
+    jacobian: np.ndarray,
+    position_error: np.ndarray,
+    damping: float,
+    component_clips: np.ndarray,
+    gain: float,
+) -> np.ndarray:
+    """Return a bounded DLS correction in joint/actuator coordinates.
+
+    The helper is deliberately NumPy-only so its sign convention and bounds
+    are unit-testable without a live Warp scene.  ``position_error`` is the
+    desired displacement (anchor minus current site position).
+    """
+    jacobian = np.asarray(jacobian, dtype=np.float64)
+    position_error = np.asarray(position_error, dtype=np.float64).reshape(-1)
+    component_clips = np.asarray(component_clips, dtype=np.float64).reshape(-1)
+    if jacobian.ndim != 2 or jacobian.shape[0] != position_error.size:
+        raise ValueError("DLS Jacobian/error shape mismatch")
+    if jacobian.shape[1] != component_clips.size:
+        raise ValueError("DLS Jacobian/clip shape mismatch")
+    if damping < 0.0 or gain < 0.0:
+        raise ValueError("DLS damping and gain must be non-negative")
+    lhs = jacobian.T @ jacobian + float(damping) * np.eye(jacobian.shape[1])
+    correction = np.linalg.solve(lhs, jacobian.T @ position_error) * float(gain)
+    return np.clip(correction, -component_clips, component_clips)
+
+
+def _contact_ik_feedback_delta(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    contact_mask_step: torch.Tensor,
+    contact_pos_ref_step: torch.Tensor,
+    hand_contact_site_ids: list[int | None],
+    contact_indices: list[int],
+    actuator_ids: list[int],
+    config: Config,
+) -> np.ndarray | None:
+    """Compute one hand's bounded physical contact-servo target correction.
+
+    This reads the current dynamic robot state through MuJoCo Jacobians.  The
+    returned delta is applied only to robot position actuators by the caller;
+    it never changes an object body, mocap target, or qpos array.
+    """
+    if config.contact_ik_feedback_gain <= 0.0:
+        return None
+    if len(actuator_ids) != 26:
+        raise ValueError(f"Expected 26 hand actuator ids, got {actuator_ids}")
+    max_anchor_error = float(config.contact_ik_feedback_max_anchor_error_m)
+    if max_anchor_error <= 0.0:
+        raise ValueError("contact IK max anchor error must be positive")
+    active: list[tuple[int, int]] = []
+    for index in contact_indices:
+        if index >= len(hand_contact_site_ids) or index >= contact_pos_ref_step.shape[0]:
+            continue
+        site_id = hand_contact_site_ids[index]
+        if site_id is not None and float(contact_mask_step[index]) > 0.5:
+            error = (
+                contact_pos_ref_step[index].detach().cpu().numpy()
+                - np.asarray(data.site_xpos[site_id], dtype=np.float64)
+            )
+            if np.linalg.norm(error) <= max_anchor_error:
+                active.append((index, int(site_id)))
+    if not active:
+        return None
+    if config.contact_ik_feedback_strategy == "first_active":
+        active = active[:1]
+    elif config.contact_ik_feedback_strategy != "all_active":
+        raise ValueError(
+            "contact_ik_feedback_strategy must be 'all_active' or 'first_active', "
+            f"got {config.contact_ik_feedback_strategy!r}"
+        )
+    jacobians: list[np.ndarray] = []
+    errors: list[np.ndarray] = []
+    for index, site_id in active:
+        jacp = np.zeros((3, model.nv), dtype=np.float64)
+        mujoco.mj_jacSite(model, data, jacp, None, site_id)
+        jacobians.append(jacp[:, actuator_ids])
+        errors.append(
+            contact_pos_ref_step[index].detach().cpu().numpy()
+            - np.asarray(data.site_xpos[site_id], dtype=np.float64)
+        )
+    clips = np.concatenate(
+        [
+            np.full(3, config.contact_ik_feedback_wrist_translation_clip_m),
+            np.full(3, config.contact_ik_feedback_wrist_rotation_clip_rad),
+            np.full(20, config.contact_ik_feedback_finger_clip_rad),
+        ]
+    )
+    if np.any(clips < 0.0):
+        raise ValueError("contact IK feedback clips must be non-negative")
+    return _bounded_damped_least_squares(
+        np.concatenate(jacobians, axis=0),
+        np.concatenate(errors, axis=0),
+        config.contact_ik_feedback_damping,
+        clips,
+        config.contact_ik_feedback_gain,
+    )
+
+
+def _project_contact_delta_against_collision_barriers(
+    correction: np.ndarray,
+    barrier_rows: np.ndarray,
+    required_outward_displacement: np.ndarray,
+    component_clips: np.ndarray,
+    damping: float,
+) -> np.ndarray:
+    """Project a robot-target delta into contact-safe local half-spaces.
+
+    Each row is an outward hand-contact point Jacobian.  The returned delta
+    therefore cannot have a smaller outward displacement than the requested
+    bound for an already-observed hand/object collision.  The operation is a
+    bounded controller projection, not a state rewrite; callers still apply
+    the result only through the 26 robot position actuators.
+    """
+    delta = np.asarray(correction, dtype=np.float64).copy()
+    rows = np.asarray(barrier_rows, dtype=np.float64)
+    required = np.asarray(required_outward_displacement, dtype=np.float64).reshape(-1)
+    clips = np.asarray(component_clips, dtype=np.float64).reshape(-1)
+    if rows.size == 0:
+        return np.clip(delta, -clips, clips)
+    if rows.ndim != 2 or rows.shape[1] != delta.size or rows.shape[0] != required.size:
+        raise ValueError("collision barrier shape mismatch")
+    if clips.size != delta.size or damping < 0.0 or np.any(required < 0.0):
+        raise ValueError("invalid collision barrier bounds")
+    # A small deterministic sequential projection is adequate here: only the
+    # current hand/object contacts are active and each correction is local to
+    # one 10-ms control tick.  Repeating once after component clipping avoids
+    # silently reintroducing an inward component on coupled finger rows.
+    for _ in range(2):
+        for row, lower_bound in zip(rows, required, strict=True):
+            residual = float(lower_bound - row @ delta)
+            norm_sq = float(row @ row)
+            if residual > 0.0 and norm_sq > 1e-12:
+                delta += residual * row / (norm_sq + damping)
+                delta = np.clip(delta, -clips, clips)
+    return delta
+
+
+def _contact_collision_barriers(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    actuator_ids: list[int],
+    side: str,
+    config: Config,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return outward Jacobian rows for real current hand/object contacts."""
+    if config.contact_ik_collision_barrier_gain <= 0.0:
+        return np.empty((0, len(actuator_ids))), np.empty(0)
+    if config.contact_ik_collision_barrier_margin_m < 0.0:
+        raise ValueError("contact collision barrier margin must be non-negative")
+    if config.contact_ik_collision_barrier_max_contacts < 1:
+        raise ValueError("contact collision barrier max contacts must be positive")
+    hand_prefix = f"collision_hand_{side}_"
+    candidates: list[tuple[float, np.ndarray, float]] = []
+    for contact_index in range(data.ncon):
+        item = data.contact[contact_index]
+        geom1, geom2 = int(item.geom1), int(item.geom2)
+        name1 = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom1) or ""
+        name2 = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom2) or ""
+        hand_geom = geom1 if name1.startswith(hand_prefix) else geom2 if name2.startswith(hand_prefix) else None
+        object_name = name2 if hand_geom == geom1 else name1 if hand_geom == geom2 else ""
+        if hand_geom is None or "_object_" not in object_name:
+            continue
+        depth = max(0.0, -float(item.dist))
+        # MuJoCo's contact-frame x-axis points geom1 -> geom2.  Convert it
+        # to the hand's outward direction before taking the robot Jacobian.
+        outward = -np.asarray(item.frame[:3], dtype=np.float64) if hand_geom == geom1 else np.asarray(item.frame[:3], dtype=np.float64)
+        jacp = np.zeros((3, model.nv), dtype=np.float64)
+        mujoco.mj_jac(model, data, jacp, None, item.pos, int(model.geom_bodyid[hand_geom]))
+        row = outward @ jacp[:, actuator_ids]
+        required = float(config.contact_ik_collision_barrier_gain) * max(
+            0.0, depth - float(config.contact_ik_collision_barrier_margin_m)
+        )
+        candidates.append((depth, row, required))
+    candidates.sort(key=lambda entry: entry[0], reverse=True)
+    candidates = candidates[: int(config.contact_ik_collision_barrier_max_contacts)]
+    if not candidates:
+        return np.empty((0, len(actuator_ids))), np.empty(0)
+    return np.stack([entry[1] for entry in candidates]), np.asarray([entry[2] for entry in candidates])
+
+
+def _contact_feedback_component_clips(config: Config) -> np.ndarray:
+    """Return the fixed 6-wrist + 20-finger controller bounds for one hand."""
+    clips = np.concatenate(
+        [
+            np.full(3, config.contact_ik_feedback_wrist_translation_clip_m),
+            np.full(3, config.contact_ik_feedback_wrist_rotation_clip_rad),
+            np.full(20, config.contact_ik_feedback_finger_clip_rad),
+        ]
+    )
+    if np.any(clips < 0.0):
+        raise ValueError("contact IK feedback clips must be non-negative")
+    return clips
+
+
+def _update_contact_integral(
+    previous: np.ndarray,
+    correction: np.ndarray | None,
+    gain: float,
+    decay: float,
+    component_clips: np.ndarray,
+) -> np.ndarray:
+    """Update a bounded contact-only integral target correction."""
+    if gain < 0.0 or not 0.0 <= decay <= 1.0:
+        raise ValueError("contact integral gain must be non-negative and decay in [0, 1]")
+    updated = np.asarray(previous, dtype=np.float64) * decay
+    if correction is not None:
+        updated += gain * np.asarray(correction, dtype=np.float64)
+    clips = np.asarray(component_clips, dtype=np.float64)
+    if updated.shape != clips.shape:
+        raise ValueError("contact integral/clip shape mismatch")
+    return np.clip(updated, -clips, clips)
 
 
 def _normalize_yaml_value(value):
@@ -205,7 +492,11 @@ def main(config: Config):
             config.nu,
         )
         ctrl_ref = qpos_ref[:, : config.nu]
-    if config.contact_guidance and torch.all(contact <= 0):
+    if (
+        config.contact_guidance
+        and torch.all(contact <= 0)
+        and not config.allow_empty_contact_guidance
+    ):
         raise ValueError("contact_guidance is enabled, but contact mask is all zeros.")
     # hack: start from step 500
     # qpos_ref = qpos_ref[500:]
@@ -308,7 +599,7 @@ def main(config: Config):
         )
     kp_schedule = []
     kd_schedule = []
-    if contact_guidance_enabled and config.max_num_iterations > 0:
+    if contact_guidance_enabled and config.max_num_iterations > 0 and not config.allow_object_actuator_guidance:
         actuator_names = config.object_actuator_names
         if not actuator_names:
             actuator_names = [
@@ -394,9 +685,18 @@ def main(config: Config):
         left_only_zero = right_ids
 
     # initial controls
-    ctrls = ctrl_ref[: config.horizon_steps]
+    ctrls = _robot_reference_controls(
+        ctrl_ref, 0, config.horizon_steps, config.robot_reference_lookahead_steps,
+        config.robot_wrist_reference_lookahead_steps,
+        config.robot_finger_reference_lookahead_steps,
+    )
     # buffers for saving info and trajectory
     info_list = []
+    contact_integral = {
+        "right": np.zeros(26, dtype=np.float64),
+        "left": np.zeros(26, dtype=np.float64),
+    }
+    contact_integral_clips = _contact_feedback_component_clips(config)
 
     # run viewer + control loop
     t_start = time.perf_counter()
@@ -409,13 +709,102 @@ def main(config: Config):
             ref_slice = get_slice(
                 ref_data, sim_step + 1, sim_step + config.horizon_steps + 1
             )
+            # Stage-C scenes can supply object references through explicit
+            # mocap-weld constraints.  Seed the target at the current physics
+            # time for optimization.  The actual stepping loop below then
+            # advances it once per simulation substep.  Holding a target for
+            # a complete control tick makes the last ``ctrl_steps - 1``
+            # substeps chase a stale source pose when ``ctrl_dt > sim_dt``.
+            # This updates only the kinematic mocap target; object qpos is
+            # never overwritten here.
+            env = set_object_mocap_reference(config, env, qpos_ref[sim_step])
+            # This low-level state feedback is shared and bounded.  It reads
+            # the current Warp state but corrects only robot servo targets;
+            # the object reference continues through the mocap-weld path.
+            robot_state_feedback = _bounded_robot_state_feedback(
+                qpos_ref[sim_step],
+                get_qpos(config, env)[0],
+                config.robot_state_feedback_gain,
+                config.robot_state_feedback_wrist_translation_clip_m,
+                config.robot_state_feedback_wrist_rotation_clip_rad,
+                config.robot_state_feedback_finger_clip_rad,
+            )
+            # Keep the CPU MuJoCo data synchronized for the optional bounded
+            # contact feedback below.  It is used for hand-site Jacobians only
+            # and is never copied back into the Warp physical state.
+            contact_feedback: list[tuple[list[int], np.ndarray]] = []
+            if (
+                contact_guidance_enabled
+                and config.contact_ik_feedback_gain > 0.0
+                and config.contact_len > 0
+            ):
+                mj_data.qpos[:] = get_qpos(config, env)[0].detach().cpu().numpy()
+                mj_data.qvel[:] = get_qvel(config, env)[0].detach().cpu().numpy()
+                mujoco.mj_forward(mj_model, mj_data)
+                contact_mask_step = contact[sim_step][
+                    contact_offset : contact_offset + config.contact_len
+                ]
+                contact_pos_ref_step = contact_pos[sim_step]
+                for side, contact_indices, actuator_ids in (
+                    ("right", config.right_contact_indices, list(range(26))),
+                    ("left", config.left_contact_indices, list(range(26, 52))),
+                ):
+                    correction = _contact_ik_feedback_delta(
+                        mj_model,
+                        mj_data,
+                        contact_mask_step,
+                        contact_pos_ref_step,
+                        config.hand_contact_site_ids,
+                        contact_indices,
+                        actuator_ids,
+                        config,
+                    )
+                    if correction is not None:
+                        rows, required = _contact_collision_barriers(
+                            mj_model, mj_data, actuator_ids, side, config
+                        )
+                        correction = _project_contact_delta_against_collision_barriers(
+                            correction,
+                            rows,
+                            required,
+                            contact_integral_clips,
+                            config.contact_ik_feedback_damping,
+                        )
+                    if config.contact_ik_integral_gain > 0.0:
+                        contact_integral[side] = _update_contact_integral(
+                            contact_integral[side],
+                            correction,
+                            config.contact_ik_integral_gain,
+                            config.contact_ik_integral_decay,
+                            contact_integral_clips,
+                        )
+                        if correction is not None:
+                            contact_feedback.append((actuator_ids, contact_integral[side]))
+                    elif correction is not None:
+                        contact_feedback.append((actuator_ids, correction))
             ctrls_for_opt = ctrls
+            if contact_feedback and config.contact_ik_feedback_apply_to_plan:
+                ctrls_for_opt = ctrls.clone()
+                for actuator_ids, correction in contact_feedback:
+                    ctrls_for_opt[: config.ctrl_steps, actuator_ids] += torch.as_tensor(
+                        correction,
+                        device=ctrls_for_opt.device,
+                        dtype=ctrls_for_opt.dtype,
+                    )
             if contact_guidance_enabled and config.contact_len > 0:
                 contact_mask_step = contact[sim_step][
                     contact_offset : contact_offset + config.contact_len
                 ]
                 contact_pos_ref_step = contact_pos[sim_step]
                 site_xpos = wp.to_torch(env.data_wp.site_xpos)[0]
+                ref_ctrl_slice = _robot_reference_controls(
+                    ctrl_ref,
+                    sim_step,
+                    ctrls.shape[0],
+                    config.robot_reference_lookahead_steps,
+                    config.robot_wrist_reference_lookahead_steps,
+                    config.robot_finger_reference_lookahead_steps,
+                )
 
                 right_delta = compute_contact_point_delta(
                     contact_mask_step,
@@ -423,6 +812,7 @@ def main(config: Config):
                     site_xpos,
                     config.hand_contact_site_ids,
                     config.right_contact_indices,
+                    config.contact_wrist_mean_feedback_strategy,
                 )
                 left_delta = compute_contact_point_delta(
                     contact_mask_step,
@@ -430,28 +820,31 @@ def main(config: Config):
                     site_xpos,
                     config.hand_contact_site_ids,
                     config.left_contact_indices,
+                    config.contact_wrist_mean_feedback_strategy,
                 )
                 if (
                     right_delta is not None
-                    and config.right_pos_ctrl_ids
+                    and config.right_wrist_pos_ctrl_ids
                     and sim_step + ctrls.shape[0] <= ctrl_ref.shape[0]
                 ):
                     ctrls_for_opt = ctrls_for_opt.clone()
-                    ref_ctrl_slice = ctrl_ref[sim_step : sim_step + ctrls.shape[0]]
-                    ctrls_for_opt[:, config.right_pos_ctrl_ids] = ref_ctrl_slice[
-                        :, config.right_pos_ctrl_ids
-                    ] + torch.clip(right_delta, -0.01, 0.01)
+                    ctrls_for_opt[:, config.right_wrist_pos_ctrl_ids] = ref_ctrl_slice[
+                        :, config.right_wrist_pos_ctrl_ids
+                    ] - config.contact_wrist_mean_feedback_gain * torch.clip(
+                        right_delta, -0.01, 0.01
+                    )
                 if (
                     left_delta is not None
-                    and config.left_pos_ctrl_ids
+                    and config.left_wrist_pos_ctrl_ids
                     and sim_step + ctrls.shape[0] <= ctrl_ref.shape[0]
                 ):
                     if ctrls_for_opt is ctrls:
                         ctrls_for_opt = ctrls_for_opt.clone()
-                        ref_ctrl_slice = ctrl_ref[sim_step : sim_step + ctrls.shape[0]]
-                    ctrls_for_opt[:, config.left_pos_ctrl_ids] = ref_ctrl_slice[
-                        :, config.left_pos_ctrl_ids
-                    ] + torch.clip(left_delta, -0.01, 0.01)
+                    ctrls_for_opt[:, config.left_wrist_pos_ctrl_ids] = ref_ctrl_slice[
+                        :, config.left_wrist_pos_ctrl_ids
+                    ] - config.contact_wrist_mean_feedback_gain * torch.clip(
+                        left_delta, -0.01, 0.01
+                    )
             if gibbs_enabled:
                 config.noise_scale = _apply_noise_mask(
                     base_noise_scale, right_only_zero
@@ -480,9 +873,48 @@ def main(config: Config):
                 infos["trace_ref"] = trace_ref_np
 
             # step environment for ctrl_steps
-            step_info = {"qpos": [], "qvel": [], "time": [], "ctrl": []}
+            # Preserve compact controller telemetry alongside the physical
+            # rollout.  It is diagnostic-only: recording these scalars does
+            # not alter the optimizer, the commanded controls, or any object
+            # state.  In particular it lets Stage-C distinguish an ineffective
+            # local contact controller from a controller that is active but
+            # faces a genuine contact/collision trade-off.
+            contact_feedback_l2 = float(
+                sum(np.linalg.norm(correction) for _actuator_ids, correction in contact_feedback)
+            )
+            step_info = {
+                "qpos": [], "qvel": [], "time": [], "ctrl": [],
+                "contact_feedback_l2": [], "contact_feedback_active_hands": [],
+            }
             for i in range(config.ctrl_steps):
                 ctrl_step = ctrls[i]
+                if contact_feedback:
+                    # The feedback must also reach the executed physical
+                    # target.  ``contact_ik_feedback_apply_to_plan`` controls
+                    # whether it additionally seeds/scopes the optimizer
+                    # above; the sampling optimizer returns a fresh control
+                    # sequence and therefore does not retain that additive
+                    # correction by itself.  This remains a bounded
+                    # low-level robot-only servo: it never alters qpos or an
+                    # object actuator.
+                    ctrl_step = ctrl_step.clone()
+                    for actuator_ids, correction in contact_feedback:
+                        ctrl_step[actuator_ids] += torch.as_tensor(
+                            correction, device=ctrl_step.device, dtype=ctrl_step.dtype
+                        )
+                if torch.count_nonzero(robot_state_feedback).item() > 0:
+                    ctrl_step = ctrl_step.clone()
+                    ctrl_step[:52] += robot_state_feedback[:52].to(
+                        device=ctrl_step.device, dtype=ctrl_step.dtype
+                    )
+
+                # Keep the physical weld target time-aligned with this exact
+                # simulation substep.  ``step_env`` integrates one ``sim_dt``
+                # after this point, hence the +1 reference sample.
+                target_index = min(sim_step + i + 1, qpos_ref.shape[0] - 1)
+                env = set_object_mocap_reference(
+                    config, env, qpos_ref[target_index]
+                )
 
                 # option 1: use mujoco step
                 # mj_data.ctrl[:] = ctrls[i].detach().cpu().numpy()
@@ -515,6 +947,8 @@ def main(config: Config):
                 step_info["qvel"].append(mj_data.qvel.copy())
                 step_info["time"].append(mj_data.time)
                 step_info["ctrl"].append(mj_data.ctrl.copy())
+                step_info["contact_feedback_l2"].append(contact_feedback_l2)
+                step_info["contact_feedback_active_hands"].append(len(contact_feedback))
             for k in step_info:
                 step_info[k] = np.stack(step_info[k], axis=0)
             infos.update(step_info)
@@ -524,11 +958,14 @@ def main(config: Config):
             # receding horizon update
             sim_step = int(np.round(mj_data.time / config.sim_dt))
             prev_ctrl = ctrls[config.ctrl_steps :]
-            new_ctrl = ctrl_ref[
-                sim_step + prev_ctrl.shape[0] : sim_step
-                + prev_ctrl.shape[0]
-                + config.ctrl_steps
-            ]
+            new_ctrl = _robot_reference_controls(
+                ctrl_ref,
+                sim_step + prev_ctrl.shape[0],
+                config.ctrl_steps,
+                config.robot_reference_lookahead_steps,
+                config.robot_wrist_reference_lookahead_steps,
+                config.robot_finger_reference_lookahead_steps,
+            )
             ctrls = torch.cat([prev_ctrl, new_ctrl], dim=0)
 
             # sync viewer state and render

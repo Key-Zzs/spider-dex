@@ -7,6 +7,21 @@ phase2_maxiter: 80
 timeout_seconds: 1800
 target_gap_m: 0.001
 penetration_margin_m: 0.0005
+collision_refinement:
+  # Resolve any remaining real MuJoCo contact after bounded Powell, before
+  # visual refinement. This is local to the responsible hand link and frame.
+  target_max_penetration_m: 0.0025
+  clearance_m: 0.0002
+  max_iterations: 3
+  max_joint_step: 0.05
+  damping: 1.0e-5
+visual_refinement:
+  # A separate real-object visual-mesh gate closes mesh-contact blind spots;
+  # it is a bounded local correction, never a global hand translation.
+  target_clearance_m: 0.001
+  max_iterations: 4
+  max_joint_step: 0.05
+  damping: 1.0e-5
 wrist_translation_bound_m: 0.015
 wrist_rotation_bound_rad: 0.17453292519943295
 weights:
