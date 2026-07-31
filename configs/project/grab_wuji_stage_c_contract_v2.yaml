@@ -26,6 +26,7 @@ non_thumb_neighbors:
 patches:
   core_radius_m: 0.012
   extended_radius_m: 0.025
+  functional_surface_radius_m: 0.040
   normal_cosine_min: 0.5
   thin_wall_normal_cosine_min: 0.0
   require_mesh_adjacency: true
