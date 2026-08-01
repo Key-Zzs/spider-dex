@@ -1,0 +1,42 @@
+# Portable Stage C-M1R repair contract. Machine paths stay in ignored
+# configs/local/paths.yaml; generated evidence stays in .local_artifacts/.
+profile_name: grab_wuji_stage_c_cm1r
+stage: C-M1R
+source_sequence: s5/cylindermedium_lift
+frozen_source_frames: [1461, 1480]
+source_fps: 120.0
+sim_timestep_s: 0.0005
+semantic_contact:
+  role_id: s5__cylindermedium_lift:0
+  side: left
+  finger: index
+  robot_region: left_index_fingertip
+  patch_id: patch:s5__cylindermedium_lift:0
+  patch_distance_m: 0.020
+  normal_cosine_min: 0.50
+  penetration_max_m: 0.003
+state_machine:
+  states: [PRE_CONTACT, ACQUIRE, RETAIN_PENDING, RETAIN, RELEASE, REGRASP, COMPLETE, FAILED]
+  acquire_entry_distance_m: [0.025, 0.030]
+  retain_hysteresis_distance_m: [0.025, 0.030]
+  confirmation_substeps: [2, 4, 8]
+  acquire_timeout_ms: [20, 40, 80]
+  regrasp_timeout_ms: [20, 40, 80]
+  max_regrasp_attempts: [1, 2]
+servo:
+  contact_target_frame: object_local
+  controlled_joint_set: [left_wrist, left_index]
+  bumpless_ramp_ms: [2, 4, 8]
+prohibited:
+  - role_or_finger_reassignment
+  - patch_expansion
+  - threshold_relaxation
+  - source_timing_change
+  - direct_robot_qpos_after_initialization
+  - direct_object_qpos
+  - full_primary
+  - oracle_c_full_sequence
+  - d2
+  - mjwp
+  - smokes
+  - stage_d

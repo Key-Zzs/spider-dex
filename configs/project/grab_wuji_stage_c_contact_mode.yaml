@@ -1,0 +1,41 @@
+# Portable C-M1/C-M2 state-machine profile.  Machine-specific paths remain in
+# configs/local/paths.yaml and are supplied at runtime.
+profile_name: grab_wuji_stage_c_contact_mode
+stage: C-M1/C-M2
+source_sequence: s5/cylindermedium_lift
+frozen_source_frames: [1461, 1480]
+source_fps: 120.0
+sim_timestep_s: 0.0005
+contract:
+  task_equivalent_patch_coverage: 0.70
+  functional_role_recall: 0.80
+  patch_distance_p95_m: 0.020
+  normal_cosine_median: 0.50
+  visual_penetration_max_m: 0.003
+  collision_penetration_max_m: 0.003
+  wrist_rmse_m: 0.03
+  fingertip_rmse_m: 0.08
+  normalized_one_frame_delta: 0.25
+state_machine:
+  states: [PRE_CONTACT, ACQUIRE, RETAIN, RELEASE, REGRASP, COMPLETE, FAILED]
+  acquire_entry_distance_m: [0.025, 0.030]
+  retain_hysteresis_distance_m: [0.025, 0.030]
+  confirmation_substeps: [2, 4, 8]
+  acquire_timeout_ms: [20, 40, 80]
+  regrasp_timeout_ms: [20, 40, 80]
+  max_regrasp_attempts: [1, 2]
+search:
+  fixed_seed_start: 20260801
+  max_dynamic_profiles: 12
+  matrix: "3 E1 + 3 E2 + 6 E3; no Cartesian product"
+prohibited:
+  - object_qpos_write
+  - qpos_teleport_after_initial_state
+  - patch_or_role_redefinition
+  - source_timing_change
+  - full_primary
+  - oracle_c_full_sequence
+  - d2
+  - mjwp
+  - smokes
+  - stage_d
