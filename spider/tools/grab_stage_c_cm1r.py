@@ -19,7 +19,7 @@ from typing import Any, Iterable
 import mujoco
 import numpy as np
 import trimesh
-from scipy.spatial.transform import Rotation
+from scipy.spatial.transform import Rotation, Slerp
 
 from spider.contact.contact_mode import ContactMode, ContactModeConfig, ContactModeMachine, ContactObservation, observation_payload
 from spider.datasets.paths import load_project_paths
@@ -113,6 +113,11 @@ def normalize_effective_profile(profile: dict[str, Any]) -> dict[str, Any]:
         "servo_integral_gain": float(profile.get("servo_integral_gain", 0.0)),
         "initial_velocity": str(profile.get("initial_velocity", "zero_hold")),
         "allow_regrasp": bool(profile.get("allow_regrasp", False)),
+        "interpolate_source_targets": bool(profile.get("interpolate_source_targets", False)),
+        "object_motion_feedforward": bool(profile.get("object_motion_feedforward", False)),
+        "move_object_target": bool(profile.get("move_object_target", True)),
+        "move_robot_reference": bool(profile.get("move_robot_reference", True)),
+        "contact_servo_enabled": bool(profile.get("contact_servo_enabled", True)),
         "recovery_reason": str(profile.get("recovery_reason", "initial")),
     }
     ContactModeConfig(
@@ -176,6 +181,11 @@ def _profile(profile_id: str, experiment: str, *, seed: int, **overrides: Any) -
         "servo_integral_gain": 0.0,
         "initial_velocity": "zero_hold",
         "allow_regrasp": False,
+        "interpolate_source_targets": False,
+        "object_motion_feedforward": False,
+        "move_object_target": True,
+        "move_robot_reference": True,
+        "contact_servo_enabled": True,
         "recovery_reason": "initial",
     }
     result.update(overrides)
@@ -225,16 +235,28 @@ def profile_matrix_coverage() -> dict[str, Any]:
 
 
 def m1_recovery_profiles() -> list[dict[str, Any]]:
-    """Eight evidence-labelled M1 repairs; this is not the historical E1--E3 search."""
+    """Causally ordered M1 confirmation profiles, never a Kp/lead grid."""
     rows = [
-        _profile("m1_object_local_baseline", "M1", seed=202608201, initial_velocity="dynamic_reference", recovery_reason="TARGET_FRAME_ERROR"),
-        _profile("m1_contact_transform_feedback", "M1", seed=202608202, initial_velocity="dynamic_reference", contact_ik_gain=4.0, recovery_reason="TARGET_FRAME_ERROR"),
-        _profile("m1_wrist_index_servo", "M1", seed=202608203, initial_velocity="dynamic_reference", contact_ik_gain=12.0, recovery_reason="CONTROLLED_DOF_INSUFFICIENT"),
-        _profile("m1_wrist_index_integral", "M1", seed=202608204, initial_velocity="dynamic_reference", contact_ik_gain=20.0, servo_integral_gain=0.03, recovery_reason="RETENTION_FAILURE"),
-        _profile("m1_wrist_index_phase_lead", "M1", seed=202608205, initial_velocity="dynamic_reference", contact_ik_gain=20.0, lead_source_frames=1, recovery_reason="TRACKING_FAILURE"),
-        _profile("m1_wrist_index_hysteresis_030", "M1", seed=202608206, initial_velocity="dynamic_reference", retain_hysteresis_distance_m=0.030, contact_ik_gain=20.0, recovery_reason="RETENTION_FAILURE"),
-        _profile("m1_wrist_index_damped", "M1", seed=202608207, initial_velocity="dynamic_reference", contact_ik_gain=30.0, contact_ik_damping=0.01, recovery_reason="FORCE_SPIKE"),
-        _profile("m1_wrist_index_ramp_8ms", "M1", seed=202608208, initial_velocity="dynamic_reference", contact_ik_gain=20.0, bumpless_ramp_ms=8, recovery_reason="BUMPLESS_TRANSFER_FAILURE"),
+        _profile(
+            "m1_r0_source_interval_interpolation", "M1", seed=202608301,
+            initial_velocity="dynamic_reference", interpolate_source_targets=True,
+            recovery_reason="TARGET_TIME_ALIGNMENT_ERROR",
+        ),
+        _profile(
+            "m1_r1_velocity_consistent_initialization", "M1", seed=202608302,
+            initial_velocity="trajectory_forward_difference", interpolate_source_targets=True,
+            recovery_reason="INITIAL_VELOCITY_MISMATCH",
+        ),
+        _profile(
+            "m1_r2_contact_consistent_initialization", "M1", seed=202608303,
+            initial_velocity="contact_consistent_forward_difference", interpolate_source_targets=True,
+            recovery_reason="INITIAL_VELOCITY_MISMATCH",
+        ),
+        _profile(
+            "m1_r3_interval_rigid_motion_feedforward", "M1", seed=202608304,
+            initial_velocity="contact_consistent_forward_difference", interpolate_source_targets=True,
+            object_motion_feedforward=True, recovery_reason="MISSING_OBJECT_MOTION_FEEDFORWARD",
+        ),
     ]
     return validate_profiles(rows)
 
@@ -266,15 +288,26 @@ def _corrected_control(
     data: mujoco.MjData,
     site_id: int,
     target: np.ndarray,
+    target_velocity: np.ndarray,
     profile: dict[str, Any],
     integral: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Object-local contact feedback using only left wrist plus index columns."""
+    """Position-plus-velocity contact feedback on left wrist/index only.
+
+    ``target_velocity`` is the frozen source-derived rigid-body contact-target
+    velocity.  It is converted into one physical simulation-step of predicted
+    Cartesian error; it is not an unconstrained lead-frame search parameter.
+    """
     jacobian = np.zeros((3, model.nv), dtype=np.float64)
     mujoco.mj_jacSite(model, data, jacobian, None, site_id)
     columns = np.asarray(CONTROLLED_COLUMNS, dtype=np.int64)
     block = jacobian[:, columns]
+    site_velocity = np.zeros(6, dtype=np.float64)
+    mujoco.mj_objectVelocity(model, data, mujoco.mjtObj.mjOBJ_SITE, site_id, site_velocity, 0)
+    linear_velocity = site_velocity[3:]
     error = np.asarray(target, dtype=np.float64) - np.asarray(data.site_xpos[site_id], dtype=np.float64)
+    if profile["object_motion_feedforward"]:
+        error = error + model.opt.timestep * (np.asarray(target_velocity, dtype=np.float64) - linear_velocity)
     raw = block.T @ np.linalg.solve(block @ block.T + float(profile["contact_ik_damping"]) * np.eye(3), error)
     raw *= float(profile["contact_ik_gain"])
     clipped = np.clip(raw, -np.array([0.02, 0.02, 0.02, 0.08, 0.08, 0.08, 0.12, 0.12, 0.12, 0.12]), np.array([0.02, 0.02, 0.02, 0.08, 0.08, 0.08, 0.12, 0.12, 0.12, 0.12]))
@@ -294,6 +327,48 @@ def _local_from_world(data: mujoco.MjData, body_id: int, world: np.ndarray) -> n
     return rotation.T @ (np.asarray(world, dtype=np.float64) - np.asarray(data.xpos[body_id], dtype=np.float64))
 
 
+def _interpolate_rotation_xyz(start_xyz: np.ndarray, end_xyz: np.ndarray, alpha: float) -> np.ndarray:
+    """Shortest-arc interpolation for a frozen XYZ Euler source sample pair."""
+    rotations = Rotation.from_euler("XYZ", np.stack((start_xyz, end_xyz), axis=0))
+    return Slerp([0.0, 1.0], rotations)([float(np.clip(alpha, 0.0, 1.0))]).as_euler("XYZ")[0]
+
+
+def interpolate_source_state(start: np.ndarray, end: np.ndarray, alpha: float) -> np.ndarray:
+    """Interpolate one 120-Hz source interval without changing its endpoints.
+
+    Robot position-control references are linearly interpolated.  The two
+    object translations are linearly interpolated and their XYZ orientations
+    use shortest-arc SO(3) interpolation so a source-Euler branch cannot make
+    a dynamic object target teleport within the interval.
+    """
+    fraction = float(np.clip(alpha, 0.0, 1.0))
+    state = (1.0 - fraction) * np.asarray(start, dtype=np.float64) + fraction * np.asarray(end, dtype=np.float64)
+    for offset in (52, 58):
+        state[offset + 3 : offset + 6] = _interpolate_rotation_xyz(start[offset + 3 : offset + 6], end[offset + 3 : offset + 6], fraction)
+    return state
+
+
+def _world_from_reference_state(state: np.ndarray, offset: int, local: np.ndarray) -> np.ndarray:
+    rotation = Rotation.from_euler("XYZ", state[offset + 3 : offset + 6]).as_matrix()
+    return np.asarray(state[offset : offset + 3], dtype=np.float64) + rotation @ np.asarray(local, dtype=np.float64)
+
+
+def _local_from_reference_state(state: np.ndarray, offset: int, world: np.ndarray) -> np.ndarray:
+    rotation = Rotation.from_euler("XYZ", state[offset + 3 : offset + 6]).as_matrix()
+    return rotation.T @ (np.asarray(world, dtype=np.float64) - np.asarray(state[offset : offset + 3], dtype=np.float64))
+
+
+def starts_new_bumpless_episode(previous: ContactMode, current: ContactMode) -> bool:
+    """Keep one continuous controller ramp across PENDING -> RETAIN.
+
+    The confirmation transition changes state-machine semantics but must not
+    reset the physical servo to its inherited hold command.  Resetting there
+    created a second zero-alpha command precisely while the object was moving.
+    """
+    retain_transfer = {ContactMode.RETAIN_PENDING, ContactMode.RETAIN}
+    return previous not in retain_transfer or current not in retain_transfer
+
+
 def _model_and_seed(window: dict[str, Any], profile: dict[str, Any]) -> tuple[mujoco.MjModel, mujoco.MjData, dict[str, int], dict[str, int], list[int], trimesh.Trimesh, str]:
     model = mujoco.MjModel.from_xml_path(str(window["physics"]["scene_act"]))
     model.opt.timestep = 0.0005
@@ -301,7 +376,15 @@ def _model_and_seed(window: dict[str, Any], profile: dict[str, Any]) -> tuple[mu
     model.actuator_biasprm[:52, 1] *= float(profile["kp_scale"])
     data = mujoco.MjData(model)
     data.qpos[:] = window["reference"][0]
-    data.qvel[:] = window["reference_qvel"][0] if profile["initial_velocity"] == "dynamic_reference" else 0.0
+    if profile["initial_velocity"] in {"dynamic_reference", "contact_consistent_forward_difference"}:
+        data.qvel[:] = window["reference_qvel"][0]
+    elif profile["initial_velocity"] == "trajectory_forward_difference":
+        # MuJoCo computes the generalized velocity for the actual joint
+        # parameterization, including compound object rotations.  This is a
+        # frozen forward difference at t0, never a post-initialization write.
+        mujoco.mj_differentiatePos(model, data.qvel, 1.0 / 120.0, window["reference"][0], window["reference"][1])
+    else:
+        data.qvel[:] = 0.0
     bodies, mocap = _preflight_object_ids(model)
     _set_object_mocap_reference(data, window["reference"][0], mocap)
     mujoco.mj_forward(model, data)
@@ -311,7 +394,48 @@ def _model_and_seed(window: dict[str, Any], profile: dict[str, Any]) -> tuple[mu
     return model, data, bodies, mocap, _site_ids(model), patch_mesh, role_id
 
 
-def _run_experiment(window: dict[str, Any], output: Path, profile: dict[str, Any], *, experiment: str, frames: int, injected_loss: bool = False) -> dict[str, Any]:
+def _initialize_contact_consistent_velocity(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    site_id: int,
+    desired_contact_velocity: np.ndarray,
+) -> dict[str, Any]:
+    """Apply one t0 legal-DOF velocity correction from frozen source motion.
+
+    The base generalized velocity is the frozen C-XA forward difference.  The
+    correction is a damped projection through the already-approved wrist/index
+    Jacobian, so the initialized fingertip velocity equals the frozen source
+    contact-anchor velocity rather than beginning with an unmodeled 0.75 m/s
+    tangential mismatch.  This function is only called before the first
+    ``mj_step`` and never during rollout.
+    """
+    actual_spatial = np.zeros(6, dtype=np.float64)
+    mujoco.mj_objectVelocity(model, data, mujoco.mjtObj.mjOBJ_SITE, site_id, actual_spatial, 0)
+    jacobian = np.zeros((3, model.nv), dtype=np.float64)
+    mujoco.mj_jacSite(model, data, jacobian, None, site_id)
+    columns = np.asarray(CONTROLLED_COLUMNS, dtype=np.int64)
+    block = jacobian[:, columns]
+    delta = block.T @ np.linalg.solve(block @ block.T + 0.002 * np.eye(3), np.asarray(desired_contact_velocity, dtype=np.float64) - actual_spatial[3:])
+    data.qvel[columns] += delta
+    mujoco.mj_forward(model, data)
+    corrected_spatial = np.zeros(6, dtype=np.float64)
+    mujoco.mj_objectVelocity(model, data, mujoco.mjtObj.mjOBJ_SITE, site_id, corrected_spatial, 0)
+    return {
+        "scheme": "forward_difference_source_anchor_plus_legal_dls_projection",
+        "source_frames": [1461, 1462],
+        "controlled_dofs": list(CONTROLLED_COLUMNS),
+        "desired_contact_velocity_mps": np.asarray(desired_contact_velocity, dtype=np.float64),
+        "before_tip_velocity_mps": actual_spatial[3:],
+        "after_tip_velocity_mps": corrected_spatial[3:],
+        "residual_norm_mps": float(np.linalg.norm(np.asarray(desired_contact_velocity, dtype=np.float64) - corrected_spatial[3:])),
+        "qvel_delta": delta,
+    }
+
+
+def _run_experiment(
+    window: dict[str, Any], output: Path, profile: dict[str, Any], *, experiment: str, frames: int,
+    injected_loss: bool = False, artifact_root: Path | None = None,
+) -> dict[str, Any]:
     """Run one real MuJoCo M0/M1/M2/M3 candidate without state teleportation."""
     profile = normalize_effective_profile(profile)
     profile["EFFECTIVE_PROFILE_HASH"] = effective_profile_hash(profile)
@@ -320,6 +444,23 @@ def _run_experiment(window: dict[str, Any], output: Path, profile: dict[str, Any
     object_body, tip_site, wrist_site = bodies["right"], sites[8], sites[6]
     reference, reference_qvel, source_frames = window["reference"], window["reference_qvel"], window["source_frames"]
     expected, anchors = window["expected"], window["anchors"]
+    source_contact_local = np.stack(
+        [_local_from_reference_state(reference[index], 52, anchors[index, 6]) for index in range(frames)], axis=0
+    )
+    initial_velocity_audit: dict[str, Any] = {
+        "scheme": str(profile["initial_velocity"]),
+        "source_frames": [int(source_frames[0]), int(source_frames[min(1, len(source_frames) - 1)])],
+        "post_initialization_qvel_writes": 0,
+    }
+    if profile["initial_velocity"] == "contact_consistent_forward_difference":
+        initial_velocity_audit.update(
+            _initialize_contact_consistent_velocity(
+                model,
+                data,
+                tip_site,
+                (np.asarray(anchors[1, 6], dtype=np.float64) - np.asarray(anchors[0, 6], dtype=np.float64)) * 120.0,
+            )
+        )
     target_data = mujoco.MjData(model)
     target_data.qpos[:] = reference[0]
     target_data.qvel[:] = 0.0
@@ -353,6 +494,10 @@ def _run_experiment(window: dict[str, Any], output: Path, profile: dict[str, Any
     last_mode = machine.mode
     injection_start = 24 if injected_loss else -1
     injection_end = 32 if injected_loss else -1
+    source_state = np.asarray(reference[0], dtype=np.float64).copy()
+    object_target_state = np.asarray(reference[0], dtype=np.float64).copy()
+    source_alpha = 0.0
+    source_interval_start_time = 0.0
 
     def observe(frame: int, substep: int, *, record: bool = True) -> ContactObservation:
         nonlocal previous_contact_position, contact_transform_object, transition_start_time, last_mode
@@ -365,12 +510,12 @@ def _run_experiment(window: dict[str, Any], output: Path, profile: dict[str, Any
         previous_contact_position = contact_position.copy()
         if pair is not None and contact_transform_object is None:
             contact_transform_object = _local_from_world(data, object_body, contact_position)
-        target_data.qpos[:] = reference[frame]
+        target_data.qpos[:] = source_state
         target_data.qvel[:] = 0.0
         mujoco.mj_forward(model, target_data)
         wrist_error = float(np.linalg.norm(data.site_xpos[wrist_site] - target_data.site_xpos[wrist_site]))
         fingertip_error = float(np.linalg.norm(data.site_xpos[tip_site] - target_data.site_xpos[tip_site]))
-        object_pos, object_rot = _object_tracking_error(data, reference[frame], bodies)
+        object_pos, object_rot = _object_tracking_error(data, source_state, bodies)
         margin, _ = v2r._joint_margin(model, np.asarray([data.qpos], dtype=np.float64))
         observation = ContactObservation(
             source_frame=int(source_frames[frame]), source_timestamp_s=float(source_frames[frame] / 120.0), sim_step=sim_step, substep=substep,
@@ -381,11 +526,11 @@ def _run_experiment(window: dict[str, Any], output: Path, profile: dict[str, Any
             penetration_m=float(depth), force_n=float(force), force_impulse_ns=float(force * model.opt.timestep), joint_margin_fraction=float(np.nanmin(margin)),
             wrist_tracking_error_m=wrist_error, fingertip_tracking_error_m=fingertip_error, object_tracking_position_m=float(np.max(object_pos)), object_tracking_rotation_rad=float(np.max(object_rot)),
             finite=bool(_finite_data(data)), joint_limit_valid=not bool(v2r.dynamic._joint_limit_violations(model, np.asarray([data.qpos], dtype=np.float64))), warning_count=len(warnings),
-            reference_qpos=tuple(np.asarray(reference[frame], dtype=np.float64)), actual_qpos=tuple(np.asarray(data.qpos, dtype=np.float64)), ctrl=tuple(np.asarray(data.ctrl, dtype=np.float64)), regrasp_attempt=machine.regrasp_attempts,
+            reference_qpos=tuple(np.asarray(source_state, dtype=np.float64)), actual_qpos=tuple(np.asarray(data.qpos, dtype=np.float64)), ctrl=tuple(np.asarray(data.ctrl, dtype=np.float64)), regrasp_attempt=machine.regrasp_attempts,
         )
         prior = machine.mode
         mode = machine.observe(observation)
-        if mode != prior:
+        if mode != prior and starts_new_bumpless_episode(prior, mode):
             transition_start_time = data.time
         last_mode = mode
         if record:
@@ -395,17 +540,45 @@ def _run_experiment(window: dict[str, Any], output: Path, profile: dict[str, Any
                 "patch_target_object": patch_target_object.tolist(), "world_patch_target": _world_from_local(data, object_body, patch_target_object).tolist(),
                 "contact_point_object_frame": _local_from_world(data, object_body, contact_position).tolist(),
                 "contact_point_world": contact_position.tolist(), "contact_transform_object": None if contact_transform_object is None else contact_transform_object.tolist(),
+                "all_hand_object_pairs": pairs,
+                "source_interval_alpha": source_alpha,
+                "source_time_s": float(source_frames[0] / 120.0 + (frame - 1 + source_alpha) / 120.0) if frame else float(source_frames[0] / 120.0),
+                "target_time_s": float(source_interval_start_time + source_alpha / 120.0),
+                "ctrl_time_s": float(data.time),
+                "mj_step_time_s": float(data.time),
+                "object_target_qpos": object_target_state[52:58].tolist(),
+                "object_actual_position": np.asarray(data.xpos[object_body], dtype=np.float64).tolist(),
             })
             timeline.append(row)
         return observation
 
-    def command(frame: int) -> None:
+    def command(frame: int, *, next_source_state: np.ndarray | None = None, next_object_target_state: np.ndarray | None = None) -> None:
         nonlocal previous_ctrl, correction_integral
         control_index = min(frame + profile["lead_source_frames"], frames - 1)
-        nominal = reference[control_index, :52].copy()
-        desired_local = contact_transform_object if machine.mode == ContactMode.RETAIN and contact_transform_object is not None else fingertip_contact_object
+        nominal = (
+            source_state[:52].copy()
+            if profile["interpolate_source_targets"] and profile["move_robot_reference"]
+            else reference[control_index if profile["move_robot_reference"] else 0, :52].copy()
+        )
+        current_local = source_contact_local[0] if frame == 0 else (1.0 - source_alpha) * source_contact_local[frame - 1] + source_alpha * source_contact_local[frame]
+        relative_local_motion = current_local - source_contact_local[0]
+        held_local = contact_transform_object if contact_transform_object is not None else fingertip_contact_object
+        desired_local = held_local + relative_local_motion
         desired_target = _world_from_local(data, object_body, desired_local)
-        correction, raw, clipped = _corrected_control(model, data, tip_site, desired_target, profile, correction_integral)
+        if next_source_state is None:
+            next_source_state = source_state
+        if next_object_target_state is None:
+            next_object_target_state = object_target_state
+        next_alpha = min(1.0, source_alpha + model.opt.timestep * 120.0)
+        next_local = source_contact_local[0] if frame == 0 else (1.0 - next_alpha) * source_contact_local[frame - 1] + next_alpha * source_contact_local[frame]
+        source_target = _world_from_reference_state(object_target_state, 52, held_local + relative_local_motion)
+        next_target = _world_from_reference_state(next_object_target_state, 52, held_local + (next_local - source_contact_local[0]))
+        target_velocity = (next_target - source_target) / model.opt.timestep
+        correction, raw, clipped = _corrected_control(model, data, tip_site, desired_target, target_velocity, profile, correction_integral)
+        if not profile["contact_servo_enabled"]:
+            correction[:] = 0.0
+            raw[:] = 0.0
+            clipped[:] = 0.0
         correction_integral = correction[np.asarray(CONTROLLED_COLUMNS)] - clipped
         if machine.mode in {ContactMode.RETAIN_PENDING, ContactMode.RETAIN, ContactMode.REGRASP, ContactMode.ACQUIRE}:
             desired = nominal + correction
@@ -424,6 +597,8 @@ def _run_experiment(window: dict[str, Any], output: Path, profile: dict[str, Any
             "patch_target_object": patch_target_object.copy(), "world_patch_target": _world_from_local(data, object_body, patch_target_object),
             "normal_gap_m": float(np.linalg.norm(desired_target - data.site_xpos[tip_site])), "normal_relative_velocity": 0.0,
             "tangential_error_m": float(np.linalg.norm(desired_target - data.site_xpos[tip_site])), "tangential_slip_velocity_mps": 0.0,
+            "desired_contact_target_velocity_mps": target_velocity,
+            "object_motion_feedforward": bool(profile["object_motion_feedforward"]),
             "contact_force_n": float(timeline[-1]["force_n"]) if timeline else 0.0, "contact_impulse_ns": float(timeline[-1]["force_impulse_ns"]) if timeline else 0.0,
             "jacobian_controlled_joints": list(CONTROLLED_COLUMNS), "raw_mode_correction": raw, "clipped_correction": clipped,
             "previous_ctrl": previous_ctrl.copy(), "new_ctrl": new_ctrl.copy(), "ctrl_delta": ctrl_delta.copy(), "blend_alpha": alpha,
@@ -462,10 +637,20 @@ def _run_experiment(window: dict[str, Any], output: Path, profile: dict[str, Any
                 "object_position_error_m": float(last["object_tracking_position_m"]), "object_rotation_error_rad": float(last["object_tracking_rotation_rad"]),
             })
             for frame in range(1, frames):
-                _set_object_mocap_reference(data, reference[frame], mocap)
+                source_interval_start_time = target_time
                 target_time += 1.0 / 120.0
                 while data.time + 0.5 * model.opt.timestep < target_time:
-                    command(frame)
+                    source_alpha = float(np.clip((data.time + model.opt.timestep - source_interval_start_time) * 120.0, 0.0, 1.0))
+                    source_state = interpolate_source_state(reference[frame - 1], reference[frame], source_alpha) if profile["interpolate_source_targets"] else np.asarray(reference[frame], dtype=np.float64).copy()
+                    if profile["interpolate_source_targets"]:
+                        next_alpha = float(np.clip(source_alpha + model.opt.timestep * 120.0, 0.0, 1.0))
+                        next_source_state = interpolate_source_state(reference[frame - 1], reference[frame], next_alpha)
+                    else:
+                        next_source_state = source_state
+                    object_target_state = source_state.copy() if profile["move_object_target"] else np.asarray(reference[0], dtype=np.float64).copy()
+                    next_object_target_state = next_source_state.copy() if profile["move_object_target"] else np.asarray(reference[0], dtype=np.float64).copy()
+                    _set_object_mocap_reference(data, object_target_state, mocap)
+                    command(frame, next_source_state=next_source_state, next_object_target_state=next_object_target_state)
                     mujoco.mj_step(model, data)
                     sim_step += 1
                     observe(frame, sim_step)
@@ -555,10 +740,11 @@ def _run_experiment(window: dict[str, Any], output: Path, profile: dict[str, Any
         "tracking": tracking, "object": {"position_max_m": max(row["object_position_error_m"] for row in frame_rows), "rotation_max_rad": max(row["object_rotation_error_rad"] for row in frame_rows), "object_qpos_written": False, "source_object_target_unchanged": True},
         "state_machine": {"terminal_mode": machine.mode.value, "failure_code": machine.failure_code.value if machine.failure_code else None, "regrasp_attempts": machine.regrasp_attempts, "transitions": machine.transition_payload()},
         "gates": gates,
+        "initial_velocity_audit": initial_velocity_audit,
         "first_failure": None if first_failure is None else {key: first_failure[key] for key in ("source_frame", "sim_step", "substep", "mode", "geom_pair", "patch_distance_m", "normal_gap_m", "force_n", "joint_margin_fraction")},
         "preservation": {"role_unchanged": True, "assigned_finger_unchanged": True, "patch_unchanged": True, "threshold_20mm_unchanged": True, "source_timing_unchanged": True, "source_object_target_unchanged": True, "robot_qpos_written_after_initialization": False, "object_qpos_written": False},
     }
-    root = output / {"M0": "m0_initial_hold", "M1": "m1_moving_retain", "M2": "m2_injected_regrasp", "M3": "m3_full_window"}[experiment] / profile["profile_id"]
+    root = artifact_root if artifact_root is not None else output / {"M0": "m0_initial_hold", "M1": "m1_moving_retain", "M2": "m2_injected_regrasp", "M3": "m3_full_window"}[experiment] / profile["profile_id"]
     _write_json(root / "effective_profile.json", profile)
     _write_json(root / "summary.json", metrics)
     _write_json(root / "timeline.json", {"schema_version": 1, "rows": timeline, "transitions": machine.transition_payload()})
@@ -615,7 +801,25 @@ def _render_payload(window: dict[str, Any], m0: dict[str, Any], m1: dict[str, An
     requests: list[tuple[str, str, str]] = []
     for label, result in (("m0", m0), ("m1", m1)):
         rows = result["_frame_rows"]
-        samples = rows if label == "m1" else [rows[0]]
+        samples = list(rows) if label == "m1" else [rows[0]]
+        if label == "m1":
+            first_motion = next(
+                (item for item in result["_timeline"] if int(item["source_frame"]) == 1462 and int(item["sim_step"]) == 1),
+                None,
+            )
+            if first_motion is not None:
+                samples.insert(1, {
+                    "source_frame": 1462,
+                    "qpos": np.asarray(first_motion["actual_qpos"], dtype=np.float64),
+                    "physical_contact": bool(first_motion["correct_contact"]),
+                    "patch_distance_m": float(first_motion["patch_distance_m"]),
+                    "normal_cosine": float(first_motion["normal_cosine"]),
+                    "contact_depth_m": float(first_motion["penetration_m"]),
+                    "contact_force_n": float(first_motion["force_n"]),
+                    "mode": str(first_motion["mode"]),
+                    "_timeline_event": first_motion,
+                    "_screenshot_name": "m1_first_motion_substep",
+                })
         for index, row in enumerate(samples):
             source = int(row["source_frame"])
             local = int(np.where(window["source_frames"] == source)[0][0])
@@ -626,7 +830,7 @@ def _render_payload(window: dict[str, Any], m0: dict[str, Any], m1: dict[str, An
             reference_meshes = _state_meshes(model, reference, cache)
             stage_b_meshes = _state_meshes(model, stage_b_state, cache)
             timeline = [item for item in result["_timeline"] if int(item["source_frame"]) == source]
-            event = timeline[-1] if timeline else {}
+            event = row.get("_timeline_event", timeline[-1] if timeline else {})
             contacts = _contact_records(model, actual)
             actual_pair = [item for item in contacts if frozenset((item["geom1"], item["geom2"])) == ASSIGNED_PAIR]
             contact_points = [item["position"] for item in contacts]
@@ -661,8 +865,8 @@ def _render_payload(window: dict[str, Any], m0: dict[str, Any], m1: dict[str, An
                         requests.append((key, view, event_name))
             else:
                 for view in ("global", "close", "top"):
-                    requests.append((key, view, f"m1_{source}"))
-    return {"schema_version": 1, "status": "PASS", "disclaimer": "C-M1R FAILURE DIAGNOSTIC — NOT AN ACCEPTANCE ARTIFACT" if m1["status"] != "PASS" else "C-M1R SHORT-WINDOW WITNESS — NOT FULL STAGE C ACCEPTANCE", "frames": frames, "screenshot_requests": requests, "events": [{"source_frame": 1465, "label": "old first loss"}, {"source_frame": 1461, "label": "new RETAIN entry"}], "metadata": {"full_wuji_visual_mesh": True, "full_wuji_collision_proxy": True, "semantic_patch_is_connected_surface": True, "object_qpos_written": False, "frozen_window": [1461, 1480]}}
+                    requests.append((key, view, str(row.get("_screenshot_name", f"m1_{source}"))))
+    return {"schema_version": 1, "status": "PASS", "disclaimer": "M1 MOVING CONTACT RETENTION FAILURE DIAGNOSTIC — NOT AN ACCEPTANCE ARTIFACT" if m1["status"] != "PASS" else "M1 MOVING CONTACT RETENTION WITNESS — NOT FULL STAGE C ACCEPTANCE", "frames": frames, "screenshot_requests": requests, "events": [{"source_frame": 1462, "label": "old first loss"}, {"source_frame": 1461, "label": "new RETAIN entry"}], "metadata": {"full_wuji_visual_mesh": True, "full_wuji_collision_proxy": True, "semantic_patch_is_connected_surface": True, "object_qpos_written": False, "frozen_window": [1461, 1480]}}
 
 
 def _strip_runtime(result: dict[str, Any]) -> dict[str, Any]:

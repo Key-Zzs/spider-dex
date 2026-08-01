@@ -1,63 +1,42 @@
 # Stage C C-M1R handoff
 
-## Status
+## Current status
 
-- C-M1 old software structure: `PASS`.
-- Old C-M2 conclusion: `INVALID_OR_INCOMPLETE_FOR_CONTACT_MODE_CONCLUSION`.
-- C-M1R implementation (R1/R2/R3): `PASS`.
-- M0 initial hold: `PASS`.
-- M1 moving retention: `FAIL` after eight bounded implementation repairs.
-- M2 injected regrasp: `NOT_RUN`; M1 did not pass.
-- M3 frozen 1461..1480 window: `NOT_RUN`; M2 did not run.
-- Dynamic witness: `NOT_FOUND`.
-- Real 3D visualization / Chrome screenshots: `PASS` (30 required captures plus comparison views).
-- Full primary, Oracle C full, D2, MJWP, smokes: `NOT_RUN`; Stage D: `NOT_STARTED`.
-- User visual review: `PENDING`.
+- Base: `e9f248ec6aa581ae139fae8d8f7f5a32a858b65b` on `develop/wuji-hand2`.
+- Frozen role: left-index `SUPPORT`, `s5__cylindermedium_lift:0`,
+  `patch:s5__cylindermedium_lift:0`; source frames remain `1461..1480` at
+  120 Hz.
+- Historical M1 is preserved as `HISTORICAL_M1_FAILURE` under
+  `.local_artifacts/stage_c_cm1r/20260801T140000Z-cm1r/`.
+- Latest recovery run:
+  `.local_artifacts/stage_c_cm1r/20260801T072352Z-m1-recovery/`.
+- M0 regression: `PASS` (100% continuity, P95 7.22 mm, peak 0.339 N).
+- 1461→1462 causal audit: `PASS`.
+- Two-frame retention: `FAIL`; M1: `FAIL`; M2/M3: `NOT_RUN`.
+- Dynamic witness: `NOT_FOUND`; user visual review: `PENDING`.
 
-## Contract and preservation
+## Confirmed repairs
 
-Repository `/home/deepcybo/workspace/dex/retarget/spider-dex`, branch
-`develop/wuji-hand2`, base commit `f14cbd7efbbd29068cfaa900f977b46c42759aa0`,
-conda `spider-dex`.  Frozen primary is `s5/cylindermedium_lift`, source frames
-`[1460,1876)`, 120 Hz; this run uses `1461..1480`.  The historical first loss
-is left-index `SUPPORT`, role `s5__cylindermedium_lift:0`, patch
-`patch:s5__cylindermedium_lift:0`, source frame 1465.  Role, assigned finger,
-patch, 20 mm threshold, timing, source object targets, raw GRAB, and body
-models were unchanged. Object guidance uses mocap targets; robot/object qpos
-are initialized once and never written during stepping.
+The shared loop now interpolates frozen 120-Hz robot/object endpoints at each
+0.5-ms MuJoCo substep, uses the actual object pose for object-local contact
+targets, and records separate pre/post-step times. The bumpless controller no
+longer resets at `RETAIN_PENDING → RETAIN`, avoiding a second zero-alpha
+command during motion. The M1 profiles are a four-item causal sequence, not a
+Kp/lead grid.
 
-## What changed
+## Remaining blocker
 
-`spider/contact/contact_mode.py` adds `RETAIN_PENDING`, initial-contact
-classification, immediate provisional-loss regrasp, and real two-attempt
-regrasp resets. `spider/tools/grab_stage_c_cm1r.py` implements normalized
-effective profiles and hashes, object-local targets, left wrist/index Jacobian
-control, bumpless ramps, M0/M1 gates, complete failure localization, and
-ignored artifacts. `spider/tools/grab_stage_c_cm1r_viewer.py` creates a
-full-mesh Plotly/WebGL diagnostic. Tests are in `tests/test_stage_c_cm1r.py`.
+The specific remaining classification is
+`TARGET_TIME_ALIGNMENT_ERROR_PLUS_OBJECT_COUPLED_NORMAL_SEPARATION`.
+Interpolation delays the historical loss from substep 2 to substep 8 and
+allows RETAIN entry, but it does not retain the assigned pair through frame
+1462. Object-only motion fails while hand-only motion passes. A source-derived
+contact-consistent velocity initialization gives a 0.00146 m/s fingertip
+velocity residual but creates a 107.35 N peak, so it is rejected rather than
+presented as a witness. This is not an empirical-infeasibility conclusion.
 
-## Results and next action
+## Boundaries
 
-M0 physically held the exact pair: 100% contact continuity, P95
-`0.007174894 m`, peak `0.336134 N` (versus old `110.055558 N`), penetration
-`0.000254550 m`, margin `0.083622`, and valid `PRE_CONTACT →
-RETAIN_PENDING → RETAIN → COMPLETE` transitions.
-
-M1 first lost the exact pair at source frame 1462 / simulation step 2 for all
-eight targeted profiles. The selected phase-lead repair had continuity `1/6`
-and patch P95 `0.020345737 m`; it is `RETENTION_FAILURE`, not a valid
-contact-mode infeasibility result. Continue V2 retention/longer-horizon
-controller repair from M1 only. Do not enter V3 or run M2/M3/MJWP/Stage D.
-
-## Evidence
-
-Run root: `.local_artifacts/stage_c_cm1r/20260801T140000Z-cm1r/`.
-
-- `reports/cm1r_old_experiment_validity_audit.json`
-- `reports/profile_matrix_coverage.json`
-- `reports/m0_initial_hold_summary.json`
-- `reports/m1_moving_retention_summary.json`
-- `reports/cm1r_manual_visual_review.json`
-- `html/stage_c_cm1r_contact_mode.html`
-- `html/stage_c_cm1r_visual_index.html`
-- `screenshots/repaired_close/`
+No raw GRAB/body model/role/patch/timing/object target changed. There are no
+post-initialization robot or object qpos writes. Full primary, Oracle C, D2,
+MJWP, smokes, and Stage D remain unrun.

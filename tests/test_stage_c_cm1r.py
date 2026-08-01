@@ -5,7 +5,9 @@ from __future__ import annotations
 import unittest
 
 from spider.contact.contact_mode import ContactMode, ContactModeConfig, ContactModeMachine, ContactObservation, FailureCode
-from spider.tools.grab_stage_c_cm1r import _profile, effective_profile_hash, m1_recovery_profiles, normalize_effective_profile, profile_matrix_coverage, validate_profiles
+import numpy as np
+
+from spider.tools.grab_stage_c_cm1r import _profile, effective_profile_hash, interpolate_source_state, m1_recovery_profiles, normalize_effective_profile, profile_matrix_coverage, starts_new_bumpless_episode, validate_profiles
 
 
 def _observation(step: int, **override: object) -> ContactObservation:
@@ -66,8 +68,28 @@ class CM1RProfileIntegrityTest(unittest.TestCase):
 
     def test_m1_repairs_are_bounded_and_unique(self) -> None:
         profiles = m1_recovery_profiles()
-        self.assertEqual(len(profiles), 8)
-        self.assertEqual(len({row["EFFECTIVE_PROFILE_HASH"] for row in profiles}), 8)
+        self.assertEqual(len(profiles), 4)
+        self.assertEqual(len({row["EFFECTIVE_PROFILE_HASH"] for row in profiles}), 4)
+        self.assertTrue(all(row["interpolate_source_targets"] for row in profiles))
+        self.assertTrue(profiles[-1]["object_motion_feedforward"])
+        self.assertEqual(profiles[1]["initial_velocity"], "trajectory_forward_difference")
+        self.assertEqual(profiles[2]["initial_velocity"], "contact_consistent_forward_difference")
+
+    def test_source_interval_interpolation_preserves_endpoints_and_shortest_rotation(self) -> None:
+        start = np.zeros(64, dtype=np.float64)
+        end = np.zeros(64, dtype=np.float64)
+        start[52:58] = [0.0, 0.0, 0.0, 0.0, 0.0, np.deg2rad(179.0)]
+        end[52:58] = [0.016, -0.008, 0.004, 0.0, 0.0, np.deg2rad(-179.0)]
+        np.testing.assert_allclose(interpolate_source_state(start, end, 0.0), start)
+        np.testing.assert_allclose(interpolate_source_state(start, end, 1.0), end)
+        middle = interpolate_source_state(start, end, 0.5)
+        np.testing.assert_allclose(middle[52:55], [0.008, -0.004, 0.002])
+        self.assertGreater(abs(middle[57]), np.deg2rad(170.0))
+
+    def test_retain_confirmation_does_not_restart_bumpless_episode(self) -> None:
+        self.assertFalse(starts_new_bumpless_episode(ContactMode.RETAIN_PENDING, ContactMode.RETAIN))
+        self.assertTrue(starts_new_bumpless_episode(ContactMode.PRE_CONTACT, ContactMode.RETAIN_PENDING))
+        self.assertTrue(starts_new_bumpless_episode(ContactMode.RETAIN, ContactMode.REGRASP))
 
 
 class CM1RTransitionTest(unittest.TestCase):

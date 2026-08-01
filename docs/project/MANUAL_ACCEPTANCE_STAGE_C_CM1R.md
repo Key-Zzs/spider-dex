@@ -1,33 +1,16 @@
-# Manual acceptance — Stage C C-M1R
+# Manual acceptance — Stage C C-M1R M1 recovery
 
-Final user review remains **PENDING**. Open the 3D HTML and verify:
+User review remains **PENDING**. Open the latest real WebGL page:
+`.local_artifacts/stage_c_cm1r/20260801T072352Z-m1-recovery/html/stage_c_cm1r_m1_recovery.html`.
 
-- [ ] The scene uses complete Wuji and object meshes, not rectangles or point-only proxies.
-- [ ] The semantic patch is a green connected surface.
-- [ ] Frame 1461 begins in correct left-index contact and the numerical trace enters `RETAIN_PENDING`, then `RETAIN`.
-- [ ] The M0 initial peak is not the old approximately 110 N impulse.
-- [ ] The object-frame target follows the object.
-- [ ] M1 visibly loses the same left-index contact at frame 1462; it does not swap fingers or patches.
-- [ ] There is no object teleport, qpos write, deep penetration, or persistent controller oscillation.
-- [ ] The M1 visual failure agrees with the reported `RETENTION_FAILURE` and M2/M3 are marked `NOT_RUN`.
-- [ ] The page explicitly says it is not a full Stage C acceptance artifact.
+- [ ] M0 starts with the left index on the connected semantic patch.
+- [ ] The frame-1462 first-motion substep shows a substep-interpolated object
+  target rather than a one-frame teleport.
+- [ ] The assigned pair, not another finger/palm, is lost during M1.
+- [ ] The target follows the object and no object qpos write occurs.
+- [ ] The M1 failure diagnostic visibly agrees with normal separation and the
+  numeric report.
+- [ ] There is no deep penetration or accepted 100-N-class force spike.
+- [ ] The page is labelled a failure diagnostic, not full Stage C acceptance.
 
-User feedback template:
-
-```text
-Stage C C-M1R visual review: PASS / FAIL
-
-M0 initial hold:
-- result:
-- observations:
-
-M1 moving retention:
-- result:
-- observations:
-
-3D visualization:
-- result:
-- issues:
-
-Additional observations:
-```
+M2/M3 views are intentionally absent because M1 did not pass.
