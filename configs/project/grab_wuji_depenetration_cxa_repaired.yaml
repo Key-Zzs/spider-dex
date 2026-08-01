@@ -1,0 +1,43 @@
+# Stage C-XAR repaired C-XA profile.  It retains the frozen collision/contact
+# gates and differs from the default only by a stronger finger-to-patch term.
+# Whole-hand root/wrist correction is explicitly disabled.
+seed: 20260730
+window_length: 8
+overlap: 4
+phase1_maxiter: 12
+phase2_maxiter: 80
+timeout_seconds: 1800
+target_gap_m: 0.001
+penetration_margin_m: 0.0005
+wrist_translation_bound_m: 0.015
+wrist_rotation_bound_rad: 0.17453292519943295
+allow_wrist_correction: false
+collision_refinement:
+  target_max_penetration_m: 0.0025
+  clearance_m: 0.0002
+  max_iterations: 3
+  max_joint_step: 0.05
+  damping: 1.0e-5
+visual_refinement:
+  target_clearance_m: 0.001
+  max_iterations: 4
+  max_joint_step: 0.05
+  damping: 1.0e-5
+weights:
+  penetration: 300000.0
+  # Evidence: the first root-locked candidate missed only patch P95 by
+  # 1.58 mm, while every geometric-preservation gate held.  This changes
+  # only the allowed finger-articulation trade-off, never a geometry gate.
+  contact: 10000.0
+  fingertip: 30.0
+  wrist_position: 30.0
+  wrist_rotation: 15.0
+  posture: 0.1
+  velocity: 0.25
+  acceleration: 0.05
+acceptance:
+  max_collision_penetration_m: 0.003
+  max_visual_penetration_m: 0.003
+  fingertip_rmse_m: 0.08
+  wrist_rmse_m: 0.03
+  contact_recall: 0.70

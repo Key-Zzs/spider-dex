@@ -874,16 +874,41 @@ def _site_ids(model: mujoco.MjModel) -> list[int]:
 def _joint_bounds(model: mujoco.MjModel, baseline: np.ndarray, profile: dict[str, Any], finger_only: bool) -> list[tuple[float, float]]:
     bounds: list[tuple[float, float]] = []
     trans = float(profile["wrist_translation_bound_m"]); rot = float(profile["wrist_rotation_bound_rad"])
+    wrist_indices = {0, 1, 2, 3, 4, 5, 26, 27, 28, 29, 30, 31}
     for index in range(52):
-        if index in (0, 1, 2, 26, 27, 28):
+        # This check must precede the generic wrist bounds.  The previous
+        # ordering made the documented Phase-1 ``finger_only`` mode a no-op:
+        # translation matched the first branch and rotation matched the
+        # second, so both root/wrist groups were still optimised.
+        if finger_only and index in wrist_indices:
+            bounds.append((float(baseline[index]), float(baseline[index])))
+        elif index in (0, 1, 2, 26, 27, 28):
             bounds.append((float(baseline[index] - trans), float(baseline[index] + trans)))
         elif index in (3, 4, 5, 29, 30, 31):
             bounds.append((float(baseline[index] - rot), float(baseline[index] + rot)))
-        elif finger_only and index in (3, 4, 5, 29, 30, 31):
-            bounds.append((float(baseline[index]), float(baseline[index])))
         else:
             bounds.append((float(model.jnt_range[index, 0]), float(model.jnt_range[index, 1])))
     return bounds
+
+
+def _cxa_variable_indices(allow_wrist_correction: bool) -> tuple[np.ndarray, np.ndarray]:
+    """Return explicit mutable and locked C-XA robot qpos indices.
+
+    The scene's object segment is intentionally excluded: it is immutable in
+    every C-XA profile.  The default correction is finger articulation only.
+    """
+    wrist = np.asarray((0, 1, 2, 3, 4, 5, 26, 27, 28, 29, 30, 31), dtype=np.int64)
+    fingers = np.asarray(tuple(range(6, 26)) + tuple(range(32, 52)), dtype=np.int64)
+    mutable = np.arange(52, dtype=np.int64) if allow_wrist_correction else fingers
+    locked = np.setdiff1d(np.arange(52, dtype=np.int64), mutable, assume_unique=True)
+    return mutable, locked
+
+
+def _assert_locked_dofs(candidate: np.ndarray, baseline: np.ndarray, locked_indices: np.ndarray, stage: str) -> None:
+    """Fail before serialisation if any locked wrist/root coordinate moved."""
+    delta = np.asarray(candidate, dtype=np.float64)[locked_indices] - np.asarray(baseline, dtype=np.float64)[locked_indices]
+    if not np.all(np.isfinite(delta)) or float(np.max(np.abs(delta), initial=0.0)) > 1e-12:
+        raise RuntimeError(f"C-XA locked-DOF invariant failed after {stage}: max_delta={float(np.max(np.abs(delta), initial=0.0)):.3e}")
 
 
 def _collision_depths(data: mujoco.MjData, hand_collision_ids: set[int], object_collision_ids: set[int]) -> np.ndarray:
@@ -935,6 +960,7 @@ def _visual_dls_refine(
     object_mesh: trimesh.Trimesh,
     object_body: int,
     profile: dict[str, Any],
+    mutable_indices: np.ndarray | None = None,
 ) -> tuple[np.ndarray, float, float, int]:
     """Apply bounded local DLS only when visual SDF finds deep overlap."""
     data.qpos[:52] = candidate; data.qpos[52:] = object_qpos; data.qvel[:] = 0; mujoco.mj_forward(model, data)
@@ -954,6 +980,10 @@ def _visual_dls_refine(
             break
         side, _region = region_for_geom(model, geom_id)
         indices = np.arange(26, 52) if side == "left" else np.arange(0, 26)
+        if mutable_indices is not None:
+            indices = np.intersect1d(indices, mutable_indices, assume_unique=True)
+        if len(indices) == 0:
+            raise RuntimeError("C-XA visual refinement selected no mutable DOFs for the penetrated hand")
         closest_world = closest_local @ data.xmat[object_body].reshape(3, 3).T + data.xpos[object_body]
         direction = closest_world - point_world
         norm = float(np.linalg.norm(direction))
@@ -991,6 +1021,7 @@ def _collision_dls_refine(
     hand_collision_ids: set[int],
     object_collision_ids: set[int],
     profile: dict[str, Any],
+    mutable_indices: np.ndarray | None = None,
 ) -> tuple[np.ndarray, int]:
     """Resolve a remaining real contact with a bounded contact-point DLS step."""
     value = candidate.copy()
@@ -1017,6 +1048,10 @@ def _collision_dls_refine(
         body_id = int(model.geom_bodyid[hand_geom])
         body_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id) or ""
         indices = np.arange(26, 52) if body_name.startswith("l_") else np.arange(0, 26)
+        if mutable_indices is not None:
+            indices = np.intersect1d(indices, mutable_indices, assume_unique=True)
+        if len(indices) == 0:
+            raise RuntimeError("C-XA collision refinement selected no mutable DOFs for the penetrated hand")
         normal = np.asarray(contact.frame[:3], dtype=np.float64)
         # MuJoCo's contact normal points from geom1 to geom2.  Move the hand
         # away from the object, regardless of which contact slot holds it.
@@ -1159,6 +1194,8 @@ def depenetrate_init(
         raise ValueError("C-R2 multi-start jitter requires an explicit deterministic seed")
     paths = _paths(paths_config); frozen = _pilot(sequence_id); profile_file = Path(profile_path)
     profile = yaml.safe_load(profile_file.read_text(encoding="utf-8")); profile_hash = _profile_hash(profile_file)
+    allow_wrist_correction = bool(profile.get("allow_wrist_correction", False))
+    mutable_indices, locked_indices = _cxa_variable_indices(allow_wrist_correction)
     physics_path = _stage_b_dirs(paths.workspace_root, sequence_id)[1] / "stage_c/physics_input.json"
     if not physics_path.is_file(): prepare_physics_input(paths_config, sequence_id)
     physics = json.loads(physics_path.read_text(encoding="utf-8")); model = mujoco.MjModel.from_xml_path(physics["scene_act"]); data = mujoco.MjData(model)
@@ -1229,8 +1266,9 @@ def depenetrate_init(
         data.qpos[:] = qpos; data.qvel[:] = 0; mujoco.mj_forward(model, data)
         before[frame] = _collision_depths(data, hand_collision, object_collision).max(initial=0.0)
         base52 = qpos[:52].copy(); target = references[frame]
-        # Phase 1 permits fingers only; Phase 2 then permits bounded wrist
-        # correction only if the stricter collision target remains unmet.
+        # The default is fingers only.  Historical C-XA accidentally moved
+        # wrists even in Phase 1 because its lock branch was unreachable;
+        # Phase 2 is now an explicit opt-in profile capability only.
         candidate = base52.copy(); selected_phase = 1
         if rng is not None:
             jitter = np.zeros(52, dtype=np.float64)
@@ -1242,7 +1280,10 @@ def depenetrate_init(
                 if bound > 0.0:
                     jitter[list(indices)] = rng.uniform(-bound, bound, size=len(indices))
             initial_jitters[frame] = jitter
-        for finger_only, maxiter in ((True, int(profile["phase1_maxiter"])), (False, int(profile["phase2_maxiter"]))):
+        phase_plan = [(True, int(profile["phase1_maxiter"]))]
+        if allow_wrist_correction:
+            phase_plan.append((False, int(profile["phase2_maxiter"])))
+        for finger_only, maxiter in phase_plan:
             bounds = _joint_bounds(model, base52, profile, finger_only)
             # A strict per-frame rate bound is part of the optimization domain,
             # not a post-hoc smoothing filter that could recreate penetration.
@@ -1281,18 +1322,21 @@ def depenetrate_init(
                 return weights["penetration"] * penetration + weights["contact"] * contact + weights["wrist_position"] * wrist + weights["fingertip"] * tips + weights["posture"] * float(np.square(delta).sum()) + weights["velocity"] * temporal
             result = minimize(objective, initial, method="Powell", bounds=bounds, options={"maxiter": maxiter, "xtol": 1e-4, "ftol": 1e-5})
             candidate = np.asarray(result.x, dtype=np.float64)
+            _assert_locked_dofs(candidate, base52, locked_indices, "Powell solver update")
             data.qpos[:] = qpos; data.qpos[:52] = candidate; data.qvel[:] = 0; mujoco.mj_forward(model, data)
             candidate_depth = _collision_depths(data, hand_collision, object_collision).max(initial=0.0)
             selected_phase = 1 if finger_only else 2
             if candidate_depth <= float(profile["acceptance"]["max_collision_penetration_m"]): break
         prior = None if previous is None else previous.copy()
         candidate, collision_refinement_iterations[frame] = _collision_dls_refine(
-            model, data, candidate, qpos[52:], bounds, hand_collision, object_collision, profile
+            model, data, candidate, qpos[52:], bounds, hand_collision, object_collision, profile, mutable_indices
         )
+        _assert_locked_dofs(candidate, base52, locked_indices, "collision DLS refinement")
         collision_safe_candidate = candidate.copy()
         candidate, visual_before[frame], visual_after[frame], visual_iterations[frame] = _visual_dls_refine(
-            model, data, candidate, qpos[52:], bounds, visual_geom_ids, object_mesh, object_body, profile
+            model, data, candidate, qpos[52:], bounds, visual_geom_ids, object_mesh, object_body, profile, mutable_indices
         )
+        _assert_locked_dofs(candidate, base52, locked_indices, "visual DLS refinement")
         # A visual-mesh correction is accepted only to the extent that it
         # preserves the independently audited MuJoCo collision gate.  The
         # pre-refinement candidate is known to be a bounded collision result;
@@ -1316,6 +1360,7 @@ def depenetrate_init(
                 model, data, visual_geom_ids, object_mesh, object_body
             )
         recovered[frame, :52] = candidate
+        _assert_locked_dofs(recovered[frame, :52], base52, locked_indices, "emitted state")
         # Do not feed an optional visual-only local correction into the next
         # frame's collision optimization bounds.  The primary warm-start stays
         # on the collision-optimized temporal path; final smoothness is still
@@ -1328,9 +1373,11 @@ def depenetrate_init(
         corrections[frame] = delta
     mapping = json.loads((_stage_b_dirs(paths.workspace_root, sequence_id)[1] / "source_mapping.json").read_text(encoding="utf-8"))["source_frame_indices"]
     recovered_qvel = _recovered_robot_qvel(recovered, baseline_qvel)
+    if not np.array_equal(recovered[:, 52:], baseline[:, 52:]):
+        raise RuntimeError("C-XA object-lock invariant failed before serialisation")
     _atomic_npz(artifacts["trajectory"], qpos=recovered, qvel=recovered_qvel, source_frame_indices=np.asarray(mapping, dtype=np.int64))
-    _atomic_npz(artifacts["trace"], corrections=corrections, initial_jitters=initial_jitters, phase=phase, objective_terms=objective_terms, collision_before_m=before, collision_after_m=after, collision_refinement_iterations=collision_refinement_iterations, visual_penetration_before_m=visual_before, visual_penetration_after_m=visual_after, visual_refinement_iterations=visual_iterations, visual_collision_safe_alpha=visual_collision_safe_alpha, optimizer_status=status)
-    config = {"profile_path": str(profile_file), "profile_hash": profile_hash, "candidate_profile_hash": candidate_profile_hash, "candidate_initialization": candidate_profile, "profile": profile, "optimizer": "scipy.optimize.minimize/Powell + bounded MuJoCo contact/visual point-Jacobian DLS", "seed": profile["seed"], "variables": "per-frame 52 robot qpos; object 12-qpos segment immutable", "baseline": {"source": str(_stage_b_dirs(paths.workspace_root, sequence_id)[1] / "trajectory_kinematic.npz"), "object_chart": "intrinsic_XYZ_euler_for_serial_hinges"}, "qvel_reference": {"robot": "finite difference of emitted depenetrated qpos at 120 Hz", "object": "immutable Stage-B actuator-chart qvel"}, "contact_target_gap_m": float(profile["target_gap_m"]), "contact_targets_path": contact_targets_path, "contract": "TASK_EQUIVALENT_CONTACT" if contact_targets_path else "EXACT_SOURCE_FINGER_CONTACT_V1", "continuation": ["phase0 baseline", "phase1 finger-only", "phase2 bounded wrist+fingers", "phase3 warm-start velocity regularization", "phase4 MuJoCo contact bounded DLS", "phase5 visual signed-mesh bounded DLS", "phase6 static MuJoCo verification"], "windowing": {"window_length": profile["window_length"], "overlap": profile["overlap"], "implementation": "sequential warm-started overlapping-window contract"}}
+    _atomic_npz(artifacts["trace"], corrections=corrections, initial_jitters=initial_jitters, phase=phase, objective_terms=objective_terms, collision_before_m=before, collision_after_m=after, collision_refinement_iterations=collision_refinement_iterations, visual_penetration_before_m=visual_before, visual_penetration_after_m=visual_after, visual_refinement_iterations=visual_iterations, visual_collision_safe_alpha=visual_collision_safe_alpha, optimizer_status=status, mutable_qpos_indices=mutable_indices, locked_qpos_indices=locked_indices, locked_qpos_delta=(recovered[:, :52] - baseline[:, :52])[:, locked_indices])
+    config = {"profile_path": str(profile_file), "profile_hash": profile_hash, "candidate_profile_hash": candidate_profile_hash, "candidate_initialization": candidate_profile, "profile": profile, "optimizer": "scipy.optimize.minimize/Powell + bounded MuJoCo contact/visual point-Jacobian DLS", "seed": profile["seed"], "variables": "per-frame 52 robot qpos; object 12-qpos segment immutable", "optimized_qpos_indices": mutable_indices, "locked_qpos_indices": locked_indices, "root_wrist_correction_default": "LOCKED" if not allow_wrist_correction else "EXPLICIT_PROFILE_OPT_IN", "locked_dof_invariant": "max absolute delta <= 1e-12 after every solver and DLS update", "baseline": {"source": str(_stage_b_dirs(paths.workspace_root, sequence_id)[1] / "trajectory_kinematic.npz"), "object_chart": "intrinsic_XYZ_euler_for_serial_hinges"}, "qvel_reference": {"robot": "finite difference of emitted depenetrated qpos at 120 Hz", "object": "immutable Stage-B actuator-chart qvel"}, "contact_target_gap_m": float(profile["target_gap_m"]), "contact_targets_path": contact_targets_path, "contract": "TASK_EQUIVALENT_CONTACT" if contact_targets_path else "EXACT_SOURCE_FINGER_CONTACT_V1", "continuation": ["phase0 baseline", "phase1 finger-only", "phase2 optional explicit wrist+fingers", "phase3 warm-start velocity regularization", "phase4 MuJoCo contact bounded DLS", "phase5 visual signed-mesh bounded DLS", "phase6 static MuJoCo verification"], "windowing": {"window_length": profile["window_length"], "overlap": profile["overlap"], "implementation": "sequential warm-started overlapping-window contract"}}
     _atomic_json(artifacts["config"], config)
     if not output_tag and output_dir is None:
         _atomic_json(target_dir / "selected_depenetration_profile.json", {"profile_hash": profile_hash, "profile": profile})

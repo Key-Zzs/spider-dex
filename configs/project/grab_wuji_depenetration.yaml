@@ -24,6 +24,11 @@ visual_refinement:
   damping: 1.0e-5
 wrist_translation_bound_m: 0.015
 wrist_rotation_bound_rad: 0.17453292519943295
+# C-XAR: the Stage-B wrist/root pose is a frozen upstream geometric contract.
+# Contact correction may articulate fingers, but it must not use whole-hand
+# translation or rotation as an escape route.  A separately reviewed profile
+# may opt in to wrist correction; the default must remain fail-closed.
+allow_wrist_correction: false
 weights:
   penetration: 300000.0
   contact: 5000.0
