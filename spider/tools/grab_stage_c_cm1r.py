@@ -41,6 +41,7 @@ ROLE_ID = "s5__cylindermedium_lift:0"
 REGION = "left_index_fingertip"
 ASSIGNED_PAIR = frozenset(("collision_hand_left_index_8", "right_object_0"))
 CONTROLLED_COLUMNS = tuple(range(26, 32)) + tuple(range(36, 40))
+FINGER_ONLY_CONTROLLED_COLUMNS = tuple(range(36, 40))
 
 EFFECTIVE_FIELDS = (
     "profile_id", "experiment", "seed", "acquire_entry_distance_m", "retain_hysteresis_distance_m",
@@ -129,8 +130,8 @@ def normalize_effective_profile(profile: dict[str, Any]) -> dict[str, Any]:
         max_regrasp_attempts=normalized["max_regrasp_attempts"],
         allow_regrasp=normalized["allow_regrasp"],
     )
-    if normalized["controlled_joint_set"] != ("left_wrist", "left_index"):
-        raise ValueError("C-M1R can correct only the audited left wrist plus left index set")
+    if normalized["controlled_joint_set"] not in {("left_wrist", "left_index"), ("left_index",)}:
+        raise ValueError("C-M1R can correct only the audited left wrist/index set or frozen-wrist left-index set")
     if normalized["contact_target_frame"] != "object_local":
         raise ValueError("C-M1R semantic contact targets must be object_local")
     if normalized["bumpless_ramp_ms"] not in {2, 4, 8}:
@@ -138,6 +139,16 @@ def normalize_effective_profile(profile: dict[str, Any]) -> dict[str, Any]:
     if "hysteresis_030" in normalized["profile_id"] and normalized["retain_hysteresis_distance_m"] != 0.030:
         raise ValueError("e3_hysteresis_030 must serialize retain_hysteresis_distance_m == 0.030")
     return normalized
+
+
+def _controlled_columns(profile: dict[str, Any]) -> tuple[int, ...]:
+    """Resolve the explicitly serialized correction set.
+
+    Historical C-M1R profiles retain wrist+index behavior.  Stage C-XAE M0
+    uses the stricter left-index-only set so no contact correction can unlock
+    the repaired C-XA root/wrist contract.
+    """
+    return FINGER_ONLY_CONTROLLED_COLUMNS if tuple(profile["controlled_joint_set"]) == ("left_index",) else CONTROLLED_COLUMNS
 
 
 def effective_profile_hash(profile: dict[str, Any]) -> str:
@@ -300,7 +311,7 @@ def _corrected_control(
     """
     jacobian = np.zeros((3, model.nv), dtype=np.float64)
     mujoco.mj_jacSite(model, data, jacobian, None, site_id)
-    columns = np.asarray(CONTROLLED_COLUMNS, dtype=np.int64)
+    columns = np.asarray(_controlled_columns(profile), dtype=np.int64)
     block = jacobian[:, columns]
     site_velocity = np.zeros(6, dtype=np.float64)
     mujoco.mj_objectVelocity(model, data, mujoco.mjtObj.mjOBJ_SITE, site_id, site_velocity, 0)
@@ -310,7 +321,11 @@ def _corrected_control(
         error = error + model.opt.timestep * (np.asarray(target_velocity, dtype=np.float64) - linear_velocity)
     raw = block.T @ np.linalg.solve(block @ block.T + float(profile["contact_ik_damping"]) * np.eye(3), error)
     raw *= float(profile["contact_ik_gain"])
-    clipped = np.clip(raw, -np.array([0.02, 0.02, 0.02, 0.08, 0.08, 0.08, 0.12, 0.12, 0.12, 0.12]), np.array([0.02, 0.02, 0.02, 0.08, 0.08, 0.08, 0.12, 0.12, 0.12, 0.12]))
+    clips = np.full(len(columns), 0.12, dtype=np.float64)
+    if tuple(profile["controlled_joint_set"]) == ("left_wrist", "left_index"):
+        clips[:3] = 0.02
+        clips[3:6] = 0.08
+    clipped = np.clip(raw, -clips, clips)
     integral = np.clip(integral + float(profile["servo_integral_gain"]) * clipped, -0.12, 0.12)
     correction = np.zeros(52, dtype=np.float64)
     correction[columns] = clipped + integral
@@ -439,6 +454,7 @@ def _run_experiment(
     """Run one real MuJoCo M0/M1/M2/M3 candidate without state teleportation."""
     profile = normalize_effective_profile(profile)
     profile["EFFECTIVE_PROFILE_HASH"] = effective_profile_hash(profile)
+    controlled_columns = np.asarray(_controlled_columns(profile), dtype=np.int64)
     model, data, bodies, mocap, sites, patch_mesh, role_id = _model_and_seed(window, profile)
     hand, objects = v2r._contact_ids(model)
     object_body, tip_site, wrist_site = bodies["right"], sites[8], sites[6]
@@ -471,7 +487,7 @@ def _run_experiment(
     data.ctrl[:52] = reference[0, :52]
     data.ctrl[52:] = 0.0
     previous_ctrl = np.asarray(data.ctrl[:52], dtype=np.float64).copy()
-    correction_integral = np.zeros(len(CONTROLLED_COLUMNS), dtype=np.float64)
+    correction_integral = np.zeros(len(controlled_columns), dtype=np.float64)
     machine = ContactModeMachine(ContactModeConfig(
         acquire_entry_distance_m=profile["acquire_entry_distance_m"],
         retain_hysteresis_distance_m=profile["retain_hysteresis_distance_m"],
@@ -579,7 +595,7 @@ def _run_experiment(
             correction[:] = 0.0
             raw[:] = 0.0
             clipped[:] = 0.0
-        correction_integral = correction[np.asarray(CONTROLLED_COLUMNS)] - clipped
+        correction_integral = correction[controlled_columns] - clipped
         if machine.mode in {ContactMode.RETAIN_PENDING, ContactMode.RETAIN, ContactMode.REGRASP, ContactMode.ACQUIRE}:
             desired = nominal + correction
         else:
@@ -600,7 +616,7 @@ def _run_experiment(
             "desired_contact_target_velocity_mps": target_velocity,
             "object_motion_feedforward": bool(profile["object_motion_feedforward"]),
             "contact_force_n": float(timeline[-1]["force_n"]) if timeline else 0.0, "contact_impulse_ns": float(timeline[-1]["force_impulse_ns"]) if timeline else 0.0,
-            "jacobian_controlled_joints": list(CONTROLLED_COLUMNS), "raw_mode_correction": raw, "clipped_correction": clipped,
+            "jacobian_controlled_joints": controlled_columns.tolist(), "raw_mode_correction": raw, "clipped_correction": clipped,
             "previous_ctrl": previous_ctrl.copy(), "new_ctrl": new_ctrl.copy(), "ctrl_delta": ctrl_delta.copy(), "blend_alpha": alpha,
         })
         previous_ctrl = new_ctrl.copy()

@@ -7,7 +7,7 @@ import unittest
 from spider.contact.contact_mode import ContactMode, ContactModeConfig, ContactModeMachine, ContactObservation, FailureCode
 import numpy as np
 
-from spider.tools.grab_stage_c_cm1r import _profile, effective_profile_hash, interpolate_source_state, m1_recovery_profiles, normalize_effective_profile, profile_matrix_coverage, starts_new_bumpless_episode, validate_profiles
+from spider.tools.grab_stage_c_cm1r import _controlled_columns, _profile, effective_profile_hash, interpolate_source_state, m1_recovery_profiles, normalize_effective_profile, profile_matrix_coverage, starts_new_bumpless_episode, validate_profiles
 
 
 def _observation(step: int, **override: object) -> ContactObservation:
@@ -48,6 +48,12 @@ class CM1RProfileIntegrityTest(unittest.TestCase):
         profile = normalize_effective_profile(_profile("m0", "M0", seed=1))
         self.assertEqual(profile["contact_target_frame"], "object_local")
         self.assertEqual(profile["controlled_joint_set"], ("left_wrist", "left_index"))
+
+    def test_xae_m0_finger_only_profile_excludes_every_wrist_column(self) -> None:
+        profile = normalize_effective_profile(
+            _profile("m0_xae", "M0", seed=1, controlled_joint_set=("left_index",))
+        )
+        self.assertEqual(_controlled_columns(profile), (36, 37, 38, 39))
 
     def test_duplicate_effective_profiles_are_rejected_even_with_new_names(self) -> None:
         first = _profile("first", "M1", seed=1)

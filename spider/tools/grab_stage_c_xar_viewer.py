@@ -90,13 +90,11 @@ def _baked_robot_surface(scene: Path, qpos: np.ndarray, *, geom_group: int, max_
                 faces.append(local_faces + offset)
                 offset += len(local_vertices)
             mesh = trimesh.Trimesh(vertices=np.concatenate(vertices), faces=np.concatenate(faces), process=False)
-            if len(mesh.faces) > max_faces:
-                mesh = mesh.simplify_quadric_decimation(face_count=max_faces)
-            # Wuji hand links are disconnected mesh components; the quadratic
-            # simplifier preserves a component-dependent face floor.  A final
-            # evenly stratified selection keeps only *original/simplified real
-            # triangles*, never invents geometry, and makes screenshots
-            # renderable on software WebGL.
+            # Wuji hand links are disconnected components.  Running a global
+            # quadric decimator over their concatenation can bridge unrelated
+            # links and create long synthetic triangles.  Select only original
+            # baked faces instead: this is a display-only subset of the real
+            # MuJoCo mesh and cannot change topology or spatial placement.
             if len(mesh.faces) > max_faces:
                 selected = np.linspace(0, len(mesh.faces) - 1, max_faces, dtype=np.int64)
                 mesh = trimesh.Trimesh(vertices=np.asarray(mesh.vertices), faces=np.asarray(mesh.faces)[selected], process=False)
