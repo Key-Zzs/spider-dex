@@ -1,0 +1,28 @@
+# Stage C-XAE-M1R4 指派区域接触保持
+
+- Frozen replay: `PASS`
+- Region mapping: `PASS`
+- Contact-chain audit: `PASS`
+- Loss mechanism: `REGION_NORMAL_SEPARATION`
+- Action probes: `COMPLETE`
+- Minimal repair: `NOT_APPLIED`
+- Contract-V2: `PASS`
+- Geometry: `PASS`
+- M0: `PASS`
+- Step-5: `PASS`
+- Two-frame: `FAIL`
+- M1: `NOT_RUN`
+- M1 witness: `NOT_FOUND`
+- M2/M3: `NOT_RUN`
+- full primary: `NOT_RUN`
+- Oracle C/D2: `NOT_RUN`
+- MJWP: `NOT_RUN`
+- smokes: `NOT_RUN`
+- Stage D: `NOT_RUN`
+- User visual review: `PENDING`
+- Visualization: `PASS`
+- Stage C-XAE-M1R4: `EMPIRICALLY_BLOCKED_WITHIN_BOUNDED_FINGER_ACTIONS`
+- Step-5 的 index_8→index_7 是冻结区域内合法切换；并非接触丢失。
+- Step-7 的四个合法 left-index collision geom 均不再与 object 接触；真实机制是持续 normal separation。
+- 所有允许 left-index 动作均经 FrozenActionEnvironment.step(action)；没有 root/wrist/object 权限、REGRASP、MPC 或 post-init qpos/qvel 写入。
+- 权威本地 run：`.local_artifacts/stage_c_xae_m1r4/20260802T160108Z-assigned-region-retention-final/`；30/30 Chrome 截图、77 个指定回归测试和 160 个全量测试均通过。
