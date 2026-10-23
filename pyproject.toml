@@ -29,6 +29,7 @@ dependencies = [
   # release to support older Linux hosts.
   "pymeshlab<2025",
   "open3d",
+  "scikit-image",
   "ipykernel",
   "huggingface_hub",
   "gspread",
