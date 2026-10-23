@@ -1,0 +1,32 @@
+schema_version: 1
+registry_version: q0-q4-v1
+# This registry is the recommended sequence-quality entry point.  Historical
+# Stage-C configurations remain frozen evidence and are deliberately not
+# rewritten by the Q0-Q4 screening workflow.
+recommended_primary_sequence: s7/stanfordbunny_pass_1
+recommended_backup_sequence: s10/spherelarge_pass_1
+selection_status: Q0_Q4_STAGE_B_BASELINE_PASS
+selection_evidence: .local_artifacts/stage_q0_q4_grab_screening/20260804T-q0-q4-r1/reports/q0_q4_final_acceptance.json
+sequences:
+  - sequence_id: s5/cylindermedium_lift
+    quality_status: SOURCE_QUALITY_REJECTED
+    reason_codes:
+      - OFFICIAL_AND_SPIDER_SOURCE_MATCH
+      - REVERSE_SDF_MAX_PENETRATION_10_740_MM
+      - PENETRATION_COVERS_PRIMARY_INTERACTION_INTERVAL
+      - CONTACT_AUTHORITY_CONTAMINATED
+      - DEPENETRATION_WOULD_CHANGE_SOURCE_CONTACT
+    evidence_path: .local_artifacts/stage_c_source_quality_audit/20260804T-source-quality-r2
+    allowed_uses:
+      - negative_regression
+      - source_quality_failure_example
+      - viewer_regression
+      - role_contamination_test
+    forbidden_uses:
+      - primary_acceptance
+      - backup_acceptance
+      - source_role_authority
+      - semantic_patch_authority
+      - c_xa_authority
+      - dynamic_witness
+    review_status: REVIEWED_REJECTED
